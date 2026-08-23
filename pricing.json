@@ -1,0 +1,57 @@
+{
+  "_readme": [
+    "Hand-maintained pricing table (PRD Phase 4, P1-4). Prices are USD per 1,000,000 tokens.",
+    "Keys match the model id from the wire (e.g. 'claude-haiku-4-5-20251001') by exact match",
+    "first, then LONGEST PREFIX — same rule as context-windows.json.",
+    "",
+    "WHY THE CURRENT MODELS ARE LISTED EXPLICITLY: prefix matching is a trap for pricing.",
+    "'claude-opus-4' (Opus 4.0) is $15/$75, but Opus 4.5-4.8 are $5/$25. Without an explicit",
+    "'claude-opus-4-8' entry, 'claude-opus-4-8...' would fall back to the 'claude-opus-4' prefix",
+    "and be mispriced 3x. Every current model gets its own longer-prefix key so it wins.",
+    "",
+    "A model with no entry resolves to UNKNOWN — cost is not computed and not guessed (P0-8",
+    "discipline, applied to price). The store records the tokens with cost 0 and cost_source",
+    "'unknown' rather than inventing a number. Local models are the one legitimate zero: they",
+    "carry provider 'local' and cost_source 'computed', not 'unknown'.",
+    "",
+    "CACHE MULTIPLIERS (Appendix A). cache_write has two rates by TTL. Claude Code writes its",
+    "prompt cache at the 1-HOUR rate (2.0x), NOT the 5-minute rate (1.25x) the PRD 5.2 code",
+    "snippet shows. This was proven by P1-4: the reported cost of a real haiku request",
+    "(cost_usd_micros 55312) matches 10*1 + 27541*1*2.0 + 44*5 exactly, and does NOT match the",
+    "1.25x form. computeCostMicros defaults to '1h'. See src/test.js 'reported vs computed'.",
+    "",
+    "VERIFY BEFORE TRUSTING: current-generation Anthropic prices are from the Claude API docs",
+    "(2026-06). Sonnet 5 has an intro rate of $2/$10 through 2026-08-31 not encoded here.",
+    "OpenAI cache-read discounts differ from Anthropic's 0.1x; proxy costs for OpenAI models are",
+    "therefore approximate until a per-provider multiplier is added. Local models are always $0."
+  ],
+
+  "cache_multipliers": {
+    "input": 1.0,
+    "cache_read": 0.1,
+    "cache_write_5m": 1.25,
+    "cache_write_1h": 2.0
+  },
+
+  "models": {
+    "claude-opus-4": { "input": 15, "output": 75 },
+    "claude-opus-4-1": { "input": 15, "output": 75 },
+    "claude-opus-4-5": { "input": 5, "output": 25 },
+    "claude-opus-4-6": { "input": 5, "output": 25 },
+    "claude-opus-4-7": { "input": 5, "output": 25 },
+    "claude-opus-4-8": { "input": 5, "output": 25 },
+    "claude-sonnet-4": { "input": 3, "output": 15 },
+    "claude-sonnet-4-5": { "input": 3, "output": 15 },
+    "claude-sonnet-4-6": { "input": 3, "output": 15 },
+    "claude-sonnet-5": { "input": 3, "output": 15 },
+    "claude-haiku-4-5": { "input": 1, "output": 5 },
+    "claude-fable-5": { "input": 10, "output": 50 },
+    "claude-3-7-sonnet": { "input": 3, "output": 15 },
+    "claude-3-5-sonnet": { "input": 3, "output": 15 },
+    "claude-3-5-haiku": { "input": 0.8, "output": 4 },
+    "claude-3-opus": { "input": 15, "output": 75 },
+
+    "gpt-4o": { "input": 2.5, "output": 10 },
+    "gpt-4o-mini": { "input": 0.15, "output": 0.6 }
+  }
+}

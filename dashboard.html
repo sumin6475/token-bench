@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenBench — Dashboard</title>
+<style>
+  /*
+   * TokenBench dashboard. Task-aware cost — the app's identity view.
+   * Dark-only by design (the whole app commits to one visual world).
+   *
+   * Dataviz method: palette VALIDATED against surface #171a21
+   * (worst adjacent CVD ΔE 40.5, all slots in the dark lightness band, ≥3:1):
+   *   task categorical (fixed slot order, never cycled):
+   *     coding-agent #199e70 · product-brainstorm #9085e9 ·
+   *     business-brainstorm #008300 · general #d55181 · unset = neutral gray
+   *   by-model single hue: #3987e5 (kept out of the task palette on purpose)
+   *   amber/red stay reserved for budget status.
+   */
+  :root {
+    --page: #0f1115;
+    --surface: #171a21;
+    --line: #232833;
+    --baseline: #2e3442;
+    --text: #e6e9ef;
+    --text-2: #8b93a7;
+    --muted: #667085;
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --teal: #2dd4bf;
+    --model: #3987e5;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--page); color: var(--text); font-family: var(--sans); }
+  body { padding: 20px 22px 28px; }
+
+  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 14px; }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; }
+  header .sub { font-size: 12px; color: var(--text-2); }
+  header .live { margin-left: auto; font-size: 11px; color: var(--muted); }
+
+  /* One filter row above everything it scopes. Date range first. */
+  .filters { display: flex; gap: 6px; margin-bottom: 16px; }
+  .filters button {
+    background: var(--surface); color: var(--text-2);
+    border: 1px solid var(--line); border-radius: 8px;
+    font: 12px var(--sans); padding: 5px 12px; cursor: pointer;
+  }
+  .filters button:hover { color: var(--text); }
+  .filters button.on { color: var(--text); border-color: var(--baseline); }
+  .filters button.on::before { content: "✓ "; font-weight: 700; color: var(--teal); }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .tile .lbl { font-size: 11px; color: var(--text-2); margin-bottom: 6px; }
+  .tile .val { font-size: 26px; font-weight: 600; line-height: 1.05; }
+  .tile .sub2 { font-size: 11px; color: var(--muted); margin-top: 5px; }
+  .tile .sub2 .warn { color: var(--amber); }
+  .tile .sub2 .over { color: var(--red); }
+
+  .grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  .row2col { display: grid; grid-template-columns: minmax(340px, 5fr) minmax(380px, 7fr); gap: 12px; }
+  @media (max-width: 900px) { .row2col { grid-template-columns: 1fr; } }
+
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px 12px; min-width: 0; }
+  .card h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+  .card .hint { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+  .card-head { display: flex; align-items: baseline; }
+  .legend { margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; color: var(--text-2); }
+  .legend .key { display: inline-flex; align-items: center; gap: 5px; }
+  .legend .sw { width: 9px; height: 9px; border-radius: 3px; display: inline-block; }
+
+  .plot { position: relative; }
+  .plot svg { display: block; width: 100%; }
+  .loading { opacity: 0.55; transition: opacity .15s; }  /* refetch keeps the frame */
+
+  /* by-model HTML bars */
+  .mrow { display: grid; grid-template-columns: minmax(120px, 190px) 1fr; gap: 10px; align-items: center; padding: 5px 0; border-radius: 6px; }
+  .mrow:hover { background: rgba(255,255,255,.03); }
+  .mname { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mprov { font-size: 10px; color: var(--muted); }
+  .mtrack { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .mbar { height: 16px; border-radius: 0 4px 4px 0; background: var(--model); min-width: 2px; }
+  .mbar.local { background: var(--muted); }
+  .mval { font-size: 12px; color: var(--text); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .mval .unp { color: var(--amber); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: right; color: var(--muted); font-weight: 500; font-size: 11px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; color: var(--text-2); }
+  td:first-child { color: var(--text); }
+  tr:last-child td { border-bottom: none; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 3px; margin-right: 7px; vertical-align: baseline; }
+
+  details { margin-top: 8px; }
+  summary { font-size: 11px; color: var(--muted); cursor: pointer; }
+  details table { margin-top: 8px; }
+
+  /* Tooltip: values lead, labels follow; series keyed by a short color stroke. */
+  #tip {
+    position: fixed; display: none; z-index: 10; pointer-events: none;
+    background: #0c0e12; border: 1px solid var(--baseline); border-radius: 8px;
+    padding: 8px 10px; font-size: 11.5px; min-width: 150px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+  #tip .t { color: var(--text-2); margin-bottom: 5px; }
+  #tip .r { display: flex; align-items: center; gap: 7px; margin: 2px 0; }
+  #tip .k { width: 10px; height: 3px; border-radius: 2px; }
+  #tip .v { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+  #tip .n { color: var(--text-2); }
+  #tip .tot { border-top: 1px solid var(--line); margin-top: 5px; padding-top: 5px; }
+
+  .empty { color: var(--muted); font-size: 12px; padding: 26px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TokenBench</h1>
+  <span class="sub">cost by kind of work</span>
+  <span class="live" id="live"></span>
+</header>
+
+<div class="filters" id="filters" role="group" aria-label="Date range">
+  <button data-days="1">Today</button>
+  <button data-days="7" class="on">7 days</button>
+  <button data-days="14">14 days</button>
+  <button data-days="30">30 days</button>
+</div>
+
+<div class="kpis" id="kpis"></div>
+
+<div class="grid">
+  <div class="card">
+    <div class="card-head">
+      <div><h2>Daily cost by task type</h2><div class="hint" id="dailyhint"></div></div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="plot" id="dailyplot"></div>
+    <details><summary>View as table</summary><div id="dailytable"></div></details>
+  </div>
+
+  <div class="row2col">
+    <div class="card">
+      <h2>Cost by model</h2>
+      <div class="hint">local models show throughput — their cost is $0 by definition</div>
+      <div id="models"></div>
+      <details><summary>View as table</summary><div id="modeltable"></div></details>
+    </div>
+
+    <div class="card">
+      <h2>By task type</h2>
+      <div class="hint">the question this app exists to answer: where do the tokens go?</div>
+      <div id="tasktable"></div>
+    </div>
+  </div>
+</div>
+
+<div id="tip" role="tooltip"></div>
+
+<script>
+'use strict'
+
+// Fixed slot order — never cycled, never reassigned on filter (color follows entity).
+const TASKS = [
+  { id: 'coding-agent',        color: '#199e70' },
+  { id: 'product-brainstorm',  color: '#9085e9' },
+  { id: 'business-brainstorm', color: '#008300' },
+  { id: 'general',             color: '#d55181' },
+  { id: 'unset',               color: '#6b7280' },  // neutral: "no identity"
+]
+const COLOR = Object.fromEntries(TASKS.map(t => [t.id, t.color]))
+
+const el = (id) => document.getElementById(id)
+const nf = new Intl.NumberFormat('en-US')
+const usd = (m) => '$' + (m / 1e6).toFixed(4)
+const usdC = (m) => { const d = m / 1e6; return d >= 10 ? '$' + d.toFixed(1) : d >= 0.01 ? '$' + d.toFixed(2) : d > 0 ? '$' + d.toFixed(4) : '$0' }
+const tok = (n) => n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(1) + 'K' : String(n)
+
+let days = 7
+let data = null
+let firstLoad = true
+
+async function load() {
+  const plots = document.querySelectorAll('.plot, #models, #tasktable')
+  if (!firstLoad) plots.forEach(p => p.classList.add('loading'))
+  try {
+    const r = await fetch('/dashboard-data?days=' + days, { cache: 'no-store' })
+    data = await r.json()
+    render()
+    el('live').textContent = 'updated ' + new Date().toLocaleTimeString()
+  } catch { el('live').textContent = 'collector not reachable' }
+  plots.forEach(p => p.classList.remove('loading'))
+  firstLoad = false
+}
+
+// --- filters (scope everything below) ---------------------------------------
+el('filters').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return
+  document.querySelectorAll('#filters button').forEach(x => x.classList.toggle('on', x === b))
+  days = Number(b.dataset.days); firstLoad = true; load()
+})
+
+// --- tooltip -----------------------------------------------------------------
+const tip = el('tip')
+function showTip(x, y, title, rows, total) {
+  tip.replaceChildren()
+  const t = document.createElement('div'); t.className = 't'; t.textContent = title; tip.appendChild(t)
+  for (const r of rows) {
+    const d = document.createElement('div'); d.className = 'r'
+    const k = document.createElement('span'); k.className = 'k'; k.style.background = r.color
+    const v = document.createElement('span'); v.className = 'v'; v.textContent = r.value
+    const n = document.createElement('span'); n.className = 'n'; n.textContent = r.name
+    d.append(k, v, n); tip.appendChild(d)
+  }
+  if (total) {
+    const d = document.createElement('div'); d.className = 'r tot'
+    const v = document.createElement('span'); v.className = 'v'; v.textContent = total
+    const n = document.createElement('span'); n.className = 'n'; n.textContent = 'total'
+    d.append(v, n); tip.appendChild(d)
+  }
+  tip.style.display = 'block'
+  const w = tip.offsetWidth, h = tip.offsetHeight
+  tip.style.left = Math.min(x + 14, innerWidth - w - 10) + 'px'
+  tip.style.top = Math.min(y + 14, innerHeight - h - 10) + 'px'
+}
+const hideTip = () => { tip.style.display = 'none' }
+
+// --- render ------------------------------------------------------------------
+function render() {
+  if (!data || data.store === false) return
+  renderKpis(); renderLegend(); renderDaily(); renderModels(); renderTaskTable()
+  el('dailyhint').textContent = data.from === data.to ? data.from : `${data.from} → ${data.to}`
+}
+
+function renderKpis() {
+  const k = el('kpis'); k.replaceChildren()
+  const bf = data.budget_micros ? data.today.cost_micros / data.budget_micros : null
+  const tiles = [
+    { lbl: `Cost · last ${data.days === 1 ? 'day' : data.days + ' days'}`, val: usdC(data.totals.cost_micros) },
+    { lbl: 'Today vs budget', val: usdC(data.today.cost_micros),
+      sub: bf === null ? 'no budget set'
+        : `${(bf*100).toFixed(0)}% of ${usdC(data.budget_micros)}`,
+      cls: bf === null ? '' : bf >= 1 ? 'over' : bf >= 0.85 ? 'warn' : '' },
+    { lbl: 'Requests', val: nf.format(data.totals.requests) },
+    { lbl: 'Tokens in → out', val: `${tok(data.totals.in_tokens)} → ${tok(data.totals.output_tokens)}` },
+  ]
+  for (const t of tiles) {
+    const d = document.createElement('div'); d.className = 'tile'
+    const l = document.createElement('div'); l.className = 'lbl'; l.textContent = t.lbl
+    const v = document.createElement('div'); v.className = 'val'; v.textContent = t.val
+    d.append(l, v)
+    if (t.sub) {
+      const s = document.createElement('div'); s.className = 'sub2'
+      const sp = document.createElement('span'); if (t.cls) sp.className = t.cls
+      sp.textContent = t.sub; s.appendChild(sp); d.appendChild(s)
+    }
+    k.appendChild(d)
+  }
+}
+
+function renderLegend() {
+  const lg = el('legend'); lg.replaceChildren()
+  const present = new Set(data.dailyByTask.map(r => r.task_type))
+  for (const t of TASKS) {
+    if (!present.has(t.id)) continue
+    const k = document.createElement('span'); k.className = 'key'
+    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = t.color
+    k.append(sw, document.createTextNode(t.id))
+    lg.appendChild(k)
+  }
+}
+
+function renderDaily() {
+  const host = el('dailyplot'); host.replaceChildren()
+  const byDate = {}
+  for (const d of data.dates) byDate[d] = {}
+  for (const r of data.dailyByTask) { if (byDate[r.local_date]) byDate[r.local_date][r.task_type] = r }
+  const totals = data.dates.map(d => Object.values(byDate[d]).reduce((a, r) => a + r.cost_micros, 0))
+  const maxV = Math.max(...totals, 1)
+
+  if (data.totals.requests === 0) {
+    const e = document.createElement('div'); e.className = 'empty'
+    e.textContent = 'No requests in this range yet.'
+    host.appendChild(e)
+    el('dailytable').replaceChildren()
+    return
+  }
+
+  // clean ceiling: 1/2/5 × 10^n
+  const pow = Math.pow(10, Math.floor(Math.log10(maxV)))
+  const ceil = [1, 2, 5, 10].map(m => m * pow).find(c => c >= maxV)
+  const W = Math.max(320, host.clientWidth), H = 240
+  const padL = 46, padR = 8, padT = 8, padB = 22
+  const plotW = W - padL - padR, plotH = H - padT - padB
+  const NS = 'http://www.w3.org/2000/svg'
+  const svg = document.createElementNS(NS, 'svg')
+  svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('viewBox', `0 0 ${W} ${H}`)
+
+  const sy = (v) => padT + plotH * (1 - v / ceil)
+  // gridlines: solid hairlines, one step off the surface; clean tick values
+  for (let i = 0; i <= 4; i++) {
+    const v = ceil * i / 4, y = sy(v)
+    const ln = document.createElementNS(NS, 'line')
+    ln.setAttribute('x1', padL); ln.setAttribute('x2', W - padR)
+    ln.setAttribute('y1', y); ln.setAttribute('y2', y)
+    ln.setAttribute('stroke', i === 0 ? 'var(--baseline)' : 'var(--line)'); ln.setAttribute('stroke-width', '1')
+    svg.appendChild(ln)
+    const tx = document.createElementNS(NS, 'text')
+    tx.setAttribute('x', padL - 7); tx.setAttribute('y', y + 3.5); tx.setAttribute('text-anchor', 'end')
+    tx.setAttribute('fill', 'var(--muted)'); tx.setAttribute('font-size', '10')
+    tx.setAttribute('style', 'font-variant-numeric: tabular-nums')
+    tx.textContent = '$' + (v / 1e6 >= 1 ? (v / 1e6).toFixed(0) : (v / 1e6).toFixed(2).replace(/^0/, ''))
+    svg.appendChild(tx)
+  }
+
+  const band = plotW / data.dates.length
+  const barW = Math.min(24, Math.max(6, band * 0.55))
+  const GAP = 2 // surface gap between stacked segments
+  const labelEvery = Math.ceil(data.dates.length / 10)
+
+  data.dates.forEach((date, i) => {
+    const cx = padL + band * i + band / 2
+    let yCursor = sy(0)
+    const segs = TASKS.filter(t => byDate[date][t.id])
+    segs.forEach((t, si) => {
+      const r = byDate[date][t.id]
+      const hRaw = plotH * (r.cost_micros / ceil)
+      const isTop = si === segs.length - 1
+      const h = Math.max(1, hRaw - (isTop ? 0 : GAP))
+      const yTop = yCursor - hRaw
+      const x = cx - barW / 2
+      let node
+      if (isTop && h > 4) {
+        // 4px rounded data-end, square at the baseline side
+        node = document.createElementNS(NS, 'path')
+        node.setAttribute('d',
+          `M${x},${yCursor} L${x},${yTop + 4} Q${x},${yTop} ${x + 4},${yTop} L${x + barW - 4},${yTop} ` +
+          `Q${x + barW},${yTop} ${x + barW},${yTop + 4} L${x + barW},${yCursor} Z`)
+      } else {
+        node = document.createElementNS(NS, 'rect')
+        node.setAttribute('x', x); node.setAttribute('y', yTop)
+        node.setAttribute('width', barW); node.setAttribute('height', h)
+      }
+      node.setAttribute('fill', t.color)
+      node.setAttribute('data-col', i)
+      svg.appendChild(node)
+      yCursor = yTop
+    })
+
+    // x labels, thinned
+    if (i % labelEvery === 0) {
+      const tx = document.createElementNS(NS, 'text')
+      tx.setAttribute('x', cx); tx.setAttribute('y', H - 7); tx.setAttribute('text-anchor', 'middle')
+      tx.setAttribute('fill', 'var(--muted)'); tx.setAttribute('font-size', '10')
+      tx.textContent = date.slice(5).replace('-', '/')
+      svg.appendChild(tx)
+    }
+
+    // hit target: the whole column band (bigger than the mark)
+    const hit = document.createElementNS(NS, 'rect')
+    hit.setAttribute('x', padL + band * i); hit.setAttribute('y', padT)
+    hit.setAttribute('width', band); hit.setAttribute('height', plotH)
+    hit.setAttribute('fill', 'transparent')
+    hit.addEventListener('pointermove', (ev) => {
+      svg.querySelectorAll('[data-col]').forEach(n => n.setAttribute('opacity', n.dataset.col == i ? '1' : '0.45'))
+      const rows = TASKS.filter(t => byDate[date][t.id]).reverse().map(t => ({
+        color: t.color, name: t.id, value: usd(byDate[date][t.id].cost_micros),
+      }))
+      showTip(ev.clientX, ev.clientY, date,
+        rows.length ? rows : [{ color: 'transparent', name: 'no requests', value: '—' }],
+        rows.length > 1 ? usd(totals[i]) : null)
+    })
+    hit.addEventListener('pointerleave', () => {
+      svg.querySelectorAll('[data-col]').forEach(n => n.setAttribute('opacity', '1'))
+      hideTip()
+    })
+    svg.appendChild(hit)
+  })
+
+  host.appendChild(svg)
+
+  // table twin (the WCAG-clean equivalent)
+  const tbl = document.createElement('table')
+  const head = tbl.insertRow()
+  for (const h of ['Date', ...TASKS.map(t => t.id), 'Total']) {
+    const th = document.createElement('th'); th.textContent = h; head.appendChild(th)
+  }
+  data.dates.forEach((date, i) => {
+    if (!totals[i]) return
+    const tr = tbl.insertRow()
+    tr.insertCell().textContent = date
+    for (const t of TASKS) tr.insertCell().textContent = byDate[date][t.id] ? usd(byDate[date][t.id].cost_micros) : '—'
+    tr.insertCell().textContent = usd(totals[i])
+  })
+  el('dailytable').replaceChildren(tbl)
+}
+
+function renderModels() {
+  const host = el('models'); host.replaceChildren()
+  if (!data.byModel.length) {
+    const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'No requests in this range yet.'
+    host.appendChild(e); el('modeltable').replaceChildren(); return
+  }
+  const maxC = Math.max(...data.byModel.map(m => m.cost_micros), 1)
+  for (const m of data.byModel) {
+    const row = document.createElement('div'); row.className = 'mrow'
+    const name = document.createElement('div'); name.className = 'mname'
+    name.textContent = m.model || 'unknown'
+    const prov = document.createElement('span'); prov.className = 'mprov'; prov.textContent = '  ' + m.provider
+    name.appendChild(prov)
+    const track = document.createElement('div'); track.className = 'mtrack'
+    const bar = document.createElement('div'); bar.className = 'mbar' + (m.provider === 'local' ? ' local' : '')
+    const frac = m.cost_micros / maxC
+    bar.style.width = Math.max(1.5, frac * 72) + '%'
+    const val = document.createElement('span'); val.className = 'mval'
+    if (m.provider === 'local') {
+      val.textContent = `${tok(m.output_tokens)} tok${m.toksPerSec ? ' · ' + m.toksPerSec + ' tok/s' : ''}`
+    } else if (m.unpriced) {
+      val.textContent = usd(m.cost_micros) + ' '
+      const u = document.createElement('span'); u.className = 'unp'; u.textContent = `+${m.unpriced} unpriced`
+      val.appendChild(u)
+    } else {
+      val.textContent = usd(m.cost_micros)
+    }
+    track.append(bar, val)
+    row.append(name, track)
+    row.addEventListener('pointermove', (ev) => showTip(ev.clientX, ev.clientY, m.model || 'unknown', [
+      { color: 'var(--model)', name: 'cost', value: usd(m.cost_micros) },
+      { color: 'transparent', name: 'requests', value: nf.format(m.requests) },
+      { color: 'transparent', name: 'tokens in → out', value: `${tok(m.in_tokens)} → ${tok(m.output_tokens)}` },
+    ]))
+    row.addEventListener('pointerleave', hideTip)
+    host.appendChild(row)
+  }
+
+  const tbl = document.createElement('table')
+  const head = tbl.insertRow()
+  for (const h of ['Model', 'Provider', 'Req', 'In', 'Out', 'tok/s', 'Cost']) {
+    const th = document.createElement('th'); th.textContent = h; head.appendChild(th)
+  }
+  for (const m of data.byModel) {
+    const tr = tbl.insertRow()
+    tr.insertCell().textContent = m.model || 'unknown'
+    tr.insertCell().textContent = m.provider
+    tr.insertCell().textContent = nf.format(m.requests)
+    tr.insertCell().textContent = tok(m.in_tokens)
+    tr.insertCell().textContent = tok(m.output_tokens)
+    tr.insertCell().textContent = m.toksPerSec ?? '—'
+    tr.insertCell().textContent = usd(m.cost_micros)
+  }
+  el('modeltable').replaceChildren(tbl)
+}
+
+function renderTaskTable() {
+  const host = el('tasktable'); host.replaceChildren()
+  if (!data.byTask.length) {
+    const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'No requests in this range yet.'
+    host.appendChild(e); return
+  }
+  const total = data.byTask.reduce((a, t) => a + t.cost_micros, 0) || 1
+  const tbl = document.createElement('table')
+  const head = tbl.insertRow()
+  for (const h of ['Task', 'Sessions', 'Req', 'In', 'Out', 'Peak ctx', 'Cost', 'Share']) {
+    const th = document.createElement('th'); th.textContent = h; head.appendChild(th)
+  }
+  const order = Object.fromEntries(TASKS.map((t, i) => [t.id, i]))
+  for (const t of [...data.byTask].sort((a, b) => (order[a.task_type] ?? 9) - (order[b.task_type] ?? 9))) {
+    const tr = tbl.insertRow()
+    const c = tr.insertCell()
+    const dot = document.createElement('span'); dot.className = 'dot'
+    dot.style.background = COLOR[t.task_type] || 'var(--muted)'
+    c.append(dot, document.createTextNode(t.task_type))
+    tr.insertCell().textContent = nf.format(t.sessions)
+    tr.insertCell().textContent = nf.format(t.requests)
+    tr.insertCell().textContent = tok(t.input_tokens + t.cache_read_tokens + t.cache_creation_tokens)
+    tr.insertCell().textContent = tok(t.output_tokens)
+    tr.insertCell().textContent = t.peak_context ? tok(t.peak_context) : '—'
+    tr.insertCell().textContent = usd(t.cost_micros)
+    tr.insertCell().textContent = (t.cost_micros / total * 100).toFixed(1) + '%'
+  }
+  host.appendChild(tbl)
+}
+
+addEventListener('resize', () => { if (data) renderDaily() })
+load()
+setInterval(load, 15000)
+</script>
+</body>
+</html>

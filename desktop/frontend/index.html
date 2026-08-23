@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>TokenBench</title>
+<style>
+  /* Only shown if the window's external URL (the collector's /widget) can't be
+     reached. The window loads http://localhost:4318/widget directly; this file
+     exists so Tauri has a frontendDist and as a graceful fallback. */
+  html, body { margin: 0; height: 100%; background: #0f1115; color: #8b93a7;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .box { height: 100%; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 8px; text-align: center; padding: 20px; }
+  .t { color: #e6e9ef; font-weight: 600; }
+  code { color: #2dd4bf; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="t">TokenBench</div>
+    <div>starting the collector…</div>
+    <div style="font-size:12px">if this persists, run <code>node collector.js --db tokenbench.db</code> and reopen</div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Rust / Tauri build output
+desktop/src-tauri/target/
+
+# Bundled Node sidecar binary (~114MB, exceeds GitHub's 100MB limit).
+# Regenerate before building:  cp "$(command -v node)" desktop/src-tauri/binaries/node-aarch64-apple-darwin
+desktop/src-tauri/binaries/
+
+# SQLite store (runtime data — the app writes it to ~/Library/Application Support)
+*.db
+*.db-wal
+*.db-shm
+
+# Generated Tauri schemas (regenerated on build)
+desktop/src-tauri/gen/
+
+# macOS
+.DS_Store

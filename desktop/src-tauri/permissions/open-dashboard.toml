@@ -1,0 +1,14 @@
+# App-command permission. The widget is a REMOTE page (served by the collector
+# on :4318), and Tauri rejects custom commands from remote origins unless a
+# permission explicitly allows them (src/webview/mod.rs ACL gate). This file
+# defines that permission; capabilities/default.json grants it to the windows
+# whose remote origin is the collector.
+#
+# NOTE: the moment this manifest exists, EVERY app command needs a permission
+# entry (the ACL applies to local windows too once an app manifest is defined).
+# One command today; add new commands here as they appear.
+
+[[permission]]
+identifier = "allow-open-dashboard"
+description = "Allows opening the dashboard window from the widget."
+commands.allow = ["open_dashboard_cmd"]

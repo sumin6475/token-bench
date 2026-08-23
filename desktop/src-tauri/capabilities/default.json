@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core capability for the TokenBench window. The widget is a REMOTE page (served by the collector on :4318), so it must be listed under `remote` to receive IPC — without this, drag/close invokes from the page are silently ignored.",
+  "windows": ["main", "dashboard"],
+  "remote": {
+    "urls": ["http://localhost:4318", "http://127.0.0.1:4318"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close",
+    "allow-open-dashboard"
+  ]
+}

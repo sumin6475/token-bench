@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenBench</title>
+<style>
+  /*
+   * TokenBench widget (PRD §6). Self-contained, zero-dependency: no build step,
+   * no framework, no external fetch. Served by the collector, polls /state.
+   *
+   * The gauge math is NOT here — it comes from the store via /state
+   * (gaugePercent, contextWindow, windowKnown). This file only draws it. That
+   * keeps "context is a level, not a sum" in one place (the store), where the
+   * tests already cover it.
+   */
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --line: #262b36;
+    --text: #e6e9ef;
+    --muted: #8b93a7;
+    --teal: #2dd4bf;   /* 0–60%  room to work        (PRD §5.4) */
+    --amber: #f59e0b;  /* 60–85% compaction approaching          */
+    --red: #ef4444;    /* 85–100% imminent                        */
+    --unknown: #4b5563;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: transparent; }
+  body {
+    font-family: var(--sans);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    padding: 8px;
+    /* Low opacity when idle (PRD §6). Full on hover. */
+    opacity: 0.92;
+    transition: opacity 120ms ease;
+  }
+  body:hover { opacity: 1; }
+
+  .card {
+    width: 320px;
+    margin: 0 auto;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 10px 14px 12px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.45);
+  }
+
+  /* Drag region for app-window / frameless mode. Controls opt out via .no-drag. */
+  .titlebar {
+    -webkit-app-region: drag;
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 6px;
+  }
+  .no-drag, select, button, input { -webkit-app-region: no-drag; }
+
+  select.task {
+    background: #10131a; color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 4px 8px; font-size: 12px; font-family: var(--sans);
+    flex: 1; min-width: 0; cursor: pointer;  /* min-width:0 — may shrink so the buttons never clip */
+  }
+  .badge {
+    font-size: 10px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase;
+    padding: 3px 7px; border-radius: 999px;
+    background: rgba(45,212,191,.12); color: var(--teal);
+    border: 1px solid rgba(45,212,191,.25);
+    white-space: nowrap;
+  }
+  .sessions-pill {
+    font-size: 10px; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 3px 6px; white-space: nowrap; cursor: pointer;
+    background: none; font-family: var(--sans);
+  }
+  .sessions-pill:hover { color: var(--text); border-color: var(--baseline, var(--line)); }
+
+  /* Which-sessions popover (click the pill). */
+  .sess-pop {
+    position: absolute; top: 34px; right: 0; z-index: 20; display: none;
+    background: #0c0e12; border: 1px solid var(--line); border-radius: 10px;
+    padding: 8px 10px; min-width: 250px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.55);
+  }
+  .sess-pop .hd2 { font-size: 9px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  .sess-pop .srow { display: flex; align-items: baseline; gap: 6px; font-size: 11px; margin: 4px 0; white-space: nowrap; }
+  .sess-pop .sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); flex: none; align-self: center; }
+  .sess-pop .srow.driving .sdot { background: var(--teal); }
+  .sess-pop .smodel { color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+  .sess-pop .stask { color: var(--muted); }
+  .sess-pop .scost { margin-left: auto; font-family: var(--mono); color: var(--text); }
+  .sess-pop .sago { color: var(--muted); font-size: 10px; }
+  .dash-btn {
+    background: none; border: 1px solid var(--line); border-radius: 8px;
+    color: var(--muted); padding: 3px 7px; cursor: pointer; line-height: 0;
+  }
+  .dash-btn:hover { color: var(--teal); border-color: var(--teal); }
+
+  /* Native-chrome mode (Tauri shell): the OS window supplies rounded corners
+     and the traffic lights (titleBarStyle Overlay), so the card fills the
+     window edge-to-edge and a slim strip leaves room under the lights. */
+  .lights-strip { display: none; }
+  body.tauri-shell { padding: 0; background: var(--card); }
+  body.tauri-shell .card {
+    width: 100%; min-height: 100vh;
+    border: none; border-radius: 0; box-shadow: none;
+    display: flex; flex-direction: column;
+  }
+  body.tauri-shell .lights-strip { display: block; height: 24px; }
+  /* Instrument layout: the dial floats centered in the free space, the cost
+     readout is pinned to the bottom — no dead gap under the card. */
+  body.tauri-shell #body { flex: 1; display: flex; flex-direction: column; }
+  body.tauri-shell #live { flex: 1; display: flex; flex-direction: column; }
+  body.tauri-shell .meta { margin-top: auto; }
+  body.tauri-shell hr.divider { margin-top: auto; }
+  body.tauri-shell .empty { margin: auto; }
+  select.task:disabled { opacity: .55; cursor: default; }
+
+  .meta { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 2px; }
+  .model { font-size: 12px; color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .gauge-wrap { position: relative; margin: 2px 0 0; }
+  svg.gauge { display: block; width: 100%; height: auto; }
+  .gauge-center {
+    /* Sits in the open middle of the semicircle, clear of the hub and the
+       resting (horizontal) needle — a dial reads value-in-the-dial. */
+    position: absolute; left: 0; right: 0; bottom: 40px;
+    text-align: center; pointer-events: none;
+  }
+  .pct { font-size: 34px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .pct .unit { font-size: 16px; color: var(--muted); font-weight: 600; }
+  .pct.unknown { color: var(--unknown); }
+
+  .counts { text-align: center; margin-top: 2px; }
+  .counts .level { font-family: var(--mono); font-size: 14px; }
+  .counts .split { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .counts .split .cached { color: #7dd3fc; }
+  .counts .split .fresh { color: #fca5a5; }
+
+  hr.divider { border: none; border-top: 1px solid var(--line); margin: 9px 0 8px; }
+
+  .row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .row .k { font-size: 11px; color: var(--muted); }
+  .row .v { font-family: var(--mono); font-size: 14px; font-weight: 600; }
+
+  .budget-num { cursor: pointer; border-bottom: 1px dashed var(--line); }
+  .budget-input {
+    width: 78px; background: #10131a; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 2px 5px;
+    font-family: var(--mono); font-size: 13px;
+  }
+
+  .bar { height: 6px; background: #10131a; border-radius: 999px; overflow: hidden; border: 1px solid var(--line); }
+  .bar > i { display: block; height: 100%; width: 0%; background: var(--teal); transition: width 240ms ease, background 240ms ease; }
+
+  /* Today-by-source panel (Jan-first): one row per provider active today. */
+  .today { margin-top: 8px; display: none; }
+  .today .hd { font-size: 10px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+  .today .row2 { display: flex; justify-content: space-between; align-items: baseline; font-size: 11px; margin-bottom: 4px; }
+  .today .src { font-weight: 600; color: var(--text); }
+  .today .src.local { color: var(--teal); }
+  .today .det { font-family: var(--mono); color: var(--muted); }
+  .today .det .money { color: var(--text); }
+  .today .det .warn { color: var(--amber); }
+
+  /* Nudge: the active session is still unlabeled after a few requests. */
+  select.task.nudge { border-color: var(--amber); box-shadow: 0 0 0 1px rgba(245, 158, 11, .55); }
+
+  .empty { text-align: center; color: var(--muted); font-size: 12px; padding: 26px 8px; line-height: 1.5; }
+  .stale { color: var(--amber); }
+  .foot { text-align: center; font-size: 9px; color: #4b5563; margin-top: 6px; letter-spacing: .03em; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <!-- Sits under the native traffic lights in the Tauri shell (hidden in a
+       plain browser); also a drag region. -->
+  <div class="lights-strip" data-tauri-drag-region></div>
+  <div class="titlebar" data-tauri-drag-region style="position: relative;">
+    <select class="task" id="task" title="Task type — applies to the whole session, and is remembered for future sessions from this source">
+      <option value="coding-agent">coding-agent</option>
+      <option value="product-brainstorm">product-brainstorm</option>
+      <option value="business-brainstorm">business-brainstorm</option>
+      <option value="general">general</option>
+      <option value="unset">unset</option>
+    </select>
+    <span class="badge" id="source">—</span>
+    <button class="sessions-pill" id="sessions" style="display:none" title="Active sessions (last 30 min) — click to see which"></button>
+    <div class="sess-pop" id="sesspop"><div class="hd2">Active sessions</div><div id="sessrows"></div></div>
+    <button class="dash-btn" id="dash" title="Open dashboard (⌘D in the app)">
+      <svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+        <rect x="1" y="7" width="2.6" height="5" rx="1" fill="currentColor"/>
+        <rect x="5.2" y="4" width="2.6" height="8" rx="1" fill="currentColor"/>
+        <rect x="9.4" y="1" width="2.6" height="11" rx="1" fill="currentColor"/>
+      </svg>
+    </button>
+  </div>
+
+  <div id="body">
+    <div class="empty" id="empty">connecting…</div>
+
+    <div id="live" style="display:none">
+      <div class="meta" data-tauri-drag-region>
+        <span class="model" id="model">—</span>
+        <span class="project" id="project"></span>
+      </div>
+
+      <div class="gauge-wrap">
+        <svg class="gauge" viewBox="0 0 220 128" id="svg">
+          <path id="band-teal"  fill="none" stroke-width="14" stroke-linecap="butt" />
+          <path id="band-amber" fill="none" stroke-width="14" stroke-linecap="butt" />
+          <path id="band-red"   fill="none" stroke-width="14" stroke-linecap="butt" />
+          <line id="needle" stroke-width="3" stroke-linecap="round" />
+          <circle id="hub" r="6" />
+        </svg>
+        <div class="gauge-center">
+          <div class="pct" id="pct">—</div>
+        </div>
+      </div>
+
+      <div class="counts">
+        <div class="level" id="level">—</div>
+        <div class="split" id="split"></div>
+      </div>
+
+      <hr class="divider" />
+
+      <div class="row">
+        <span class="k">Session cost</span>
+        <span class="v" id="sessioncost">—</span>
+      </div>
+      <div class="row">
+        <span class="k">Today</span>
+        <span class="v"><span id="todaycost">—</span> <span class="k">of</span> <span class="budget-num" id="budget" title="Click to edit daily budget">—</span></span>
+      </div>
+      <div class="bar"><i id="budgetbar"></i></div>
+
+      <div class="today" id="today">
+        <div class="hd">Today by source</div>
+        <div id="todayrows"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot" id="foot">TokenBench</div>
+</div>
+
+<script>
+'use strict'
+
+// --- gauge geometry ---------------------------------------------------------
+// A top semicircle sampled as a polyline, so stroke-dasharray maps fraction to
+// arc-length linearly and we never have to fight SVG arc-flag direction.
+const CX = 110, CY = 112, R = 90
+function polar(frac) {
+  const deg = 180 - Math.max(0, Math.min(1, frac)) * 180   // 0% at left, 100% at right
+  const rad = deg * Math.PI / 180
+  return [CX + R * Math.cos(rad), CY - R * Math.sin(rad)]
+}
+function semicirclePath() {
+  let d = ''
+  for (let i = 0; i <= 90; i++) {
+    const [x, y] = polar(i / 90)
+    d += (i === 0 ? 'M' : 'L') + x.toFixed(2) + ' ' + y.toFixed(2) + ' '
+  }
+  return d.trim()
+}
+
+const bands = {
+  teal: { el: document.getElementById('band-teal'), a: 0.0, b: 0.6, color: 'var(--teal)' },
+  amber: { el: document.getElementById('band-amber'), a: 0.6, b: 0.85, color: 'var(--amber)' },
+  red: { el: document.getElementById('band-red'), a: 0.85, b: 1.0, color: 'var(--red)' },
+}
+const svg = document.getElementById('svg')
+const needle = document.getElementById('needle')
+const hub = document.getElementById('hub')
+
+// Build the arcs once; getTotalLength needs the paths in the DOM first.
+const D = semicirclePath()
+let L = 0
+for (const k in bands) { bands[k].el.setAttribute('d', D) }
+L = bands.teal.el.getTotalLength()
+function paintBand(band, color) {
+  band.el.setAttribute('stroke', color)
+  band.el.setAttribute('stroke-dasharray', ((band.b - band.a) * L).toFixed(2) + ' ' + (L * 2).toFixed(2))
+  band.el.setAttribute('stroke-dashoffset', (-band.a * L).toFixed(2))
+}
+hub.setAttribute('cx', CX); hub.setAttribute('cy', CY)
+
+function drawColoredBands() {
+  paintBand(bands.teal, 'var(--teal)')
+  paintBand(bands.amber, 'var(--amber)')
+  paintBand(bands.red, 'var(--red)')
+}
+function drawGrayBand() {
+  // Unknown model (P0-8): one flat gray arc, no needle, no percentage.
+  paintBand(bands.teal, 'var(--unknown)')
+  bands.amber.el.setAttribute('stroke-dasharray', '0 99999')
+  bands.red.el.setAttribute('stroke-dasharray', '0 99999')
+}
+function colorFor(frac) {
+  return frac >= 0.85 ? 'var(--red)' : frac >= 0.6 ? 'var(--amber)' : 'var(--teal)'
+}
+function setNeedle(frac, visible) {
+  if (!visible) { needle.style.display = 'none'; hub.setAttribute('fill', 'var(--unknown)'); return }
+  needle.style.display = ''
+  const [x, y] = polar(frac)
+  // Pull the tip in slightly so it sits inside the band ring.
+  const tx = CX + (x - CX) * 0.82, ty = CY + (y - CY) * 0.82
+  needle.setAttribute('x1', CX); needle.setAttribute('y1', CY)
+  needle.setAttribute('x2', tx.toFixed(2)); needle.setAttribute('y2', ty.toFixed(2))
+  const col = colorFor(frac)
+  needle.setAttribute('stroke', col); hub.setAttribute('fill', col)
+}
+
+// --- formatting -------------------------------------------------------------
+const nf = new Intl.NumberFormat('en-US')
+const n = (v) => (v === null || v === undefined ? '—' : nf.format(v))
+const usd = (micros) => '$' + (Number(micros || 0) / 1e6).toFixed(4)
+
+// --- elements ---------------------------------------------------------------
+const el = (id) => document.getElementById(id)
+const empty = el('empty'), live = el('live')
+
+let current = null   // last state, for the task-type/budget writes
+
+// --- render -----------------------------------------------------------------
+function render(state) {
+  current = state
+
+  if (!state || state.store === false) {
+    live.style.display = 'none'; empty.style.display = '';
+    empty.innerHTML = (state && state.message) || 'collector has no store'
+    return
+  }
+  empty.style.display = 'none'; live.style.display = '';
+
+  // s may be null (no session yet). The instrument still renders — a benchmark
+  // dial at rest reads 0, it doesn't disappear.
+  const s = state.session
+
+  // header
+  el('source').textContent = s ? (s.source || 'claude-code') : 'idle'
+  el('model').textContent = s ? (s.model || 'unknown model') : 'waiting for a session'
+  el('project').textContent = (s && s.project) || ''
+  const task = el('task')
+  task.disabled = !s
+  task.value = s && ['coding-agent','product-brainstorm','business-brainstorm','general','unset']
+    .includes(s.task_type) ? s.task_type : 'unset'
+  const sp = el('sessions')
+  if (state.sessionCount > 1) { sp.style.display = ''; sp.textContent = state.sessionCount + ' sessions' }
+  else { sp.style.display = 'none'; el('sesspop').style.display = 'none' }
+  renderSessPop(state)
+
+  // gauge — rests at 0 with the needle visible; the gray no-needle state is
+  // reserved for the one case a position would be a lie: tokens known but the
+  // model's window unknown (P0-8: never render a guessed percentage).
+  const tokens = s ? s.latest_context_tokens : null
+  if (s && tokens != null && !s.windowKnown) {
+    drawGrayBand(); setNeedle(0, false)
+    el('pct').className = 'pct unknown'; el('pct').innerHTML = '?<span class="unit"> window</span>'
+    el('level').innerHTML = n(tokens) + ' <span style="color:var(--muted)">/ ?</span>'
+    renderSplit(state.split)
+  } else {
+    const frac = (s && tokens != null && s.windowKnown) ? s.gaugePercent : 0
+    drawColoredBands(); setNeedle(frac, true)
+    el('pct').className = 'pct'
+    el('pct').innerHTML = (frac * 100).toFixed(1).replace(/\.0$/, '') + '<span class="unit">%</span>'
+    if (tokens != null) {
+      el('level').textContent = n(tokens) + ' / ' + n(s.contextWindow)
+      renderSplit(state.split)
+    } else {
+      el('level').textContent = s && s.contextWindow ? '0 / ' + n(s.contextWindow) : '0 tokens'
+      splitText(s ? 'no main-thread request yet' : 'run Claude Code or Jan to start measuring')
+    }
+  }
+
+  // cost
+  el('sessioncost').textContent = usd(s ? s.cumulative_cost_micros : 0)
+  const d = state.daily
+  el('todaycost').textContent = usd(d.cost_micros)
+  el('budget').textContent = usd(d.budget_micros)
+  const frac = d.budget_fraction === null ? 0 : d.budget_fraction
+  const bar = el('budgetbar')
+  bar.style.width = Math.min(100, frac * 100).toFixed(1) + '%'
+  bar.style.background = frac >= 1 ? 'var(--red)' : frac >= 0.85 ? 'var(--amber)' : 'var(--teal)'
+
+  // Nudge (task-type part 3): unlabeled after a few requests -> amber outline.
+  // Forgetting is fixable — relabeling applies to the whole session.
+  el('task').classList.toggle('nudge', !!s && s.task_type === 'unset' && s.request_count >= 3)
+
+  // Today by source (Jan-first): every provider that did work today, at a
+  // glance. Local models show throughput + tokens instead of a useless $0.
+  renderToday(state.todayBySource)
+
+  // staleness — the collector timestamps every state; flag a quiet session.
+  el('foot').textContent = 'updated ' + new Date().toLocaleTimeString()
+}
+
+function renderToday(rows) {
+  const panel = el('today')
+  if (!rows || !rows.length) { panel.style.display = 'none'; return }
+  panel.style.display = 'block'  // NOT '' — the stylesheet default is display:none
+  el('todayrows').innerHTML = rows.map((r) => {
+    const isLocal = r.provider === 'local'
+    const name = r.source === 'claude-code' ? 'claude code' : (r.provider || '?')
+    const det = isLocal
+      ? `${r.toksPerSec !== null ? r.toksPerSec + ' tok/s · ' : ''}${n(r.output_tokens)} tok`
+      : `<span class="money">${usd(r.cost_micros)}</span>` +
+        (r.unpriced ? ` <span class="warn">· ${r.unpriced} unpriced</span>` : '')
+    return `<div class="row2"><span class="src${isLocal ? ' local' : ''}">${name}</span>` +
+      `<span class="det">${r.requests} req · ${det}</span></div>`
+  }).join('')
+}
+
+function renderSplit(split) {
+  if (!split) { el('split').innerHTML = ''; return }
+  el('split').innerHTML =
+    '<span class="cached">' + n(split.cached) + ' cached</span> · ' +
+    '<span class="fresh">' + n(split.fresh) + ' fresh</span>'
+}
+
+function splitText(t) { el('split').textContent = t }
+
+// Preview hooks: ?shell=1 forces the app layout; ?pop=1 opens the sessions
+// popover after first render (screenshots only).
+if (location.search.includes('pop=1')) el('sesspop').style.display = 'block'
+// Preview hook: ?shell=1 forces the app layout in a plain browser (screenshots).
+if (location.search.includes('shell=1')) document.body.classList.add('tauri-shell')
+
+// --- polling ----------------------------------------------------------------
+async function poll() {
+  try {
+    const r = await fetch('/state', { cache: 'no-store' })
+    render(await r.json())
+  } catch (e) {
+    live.style.display = 'none'; empty.style.display = '';
+    empty.innerHTML = '<span class="stale">collector not reachable</span>'
+  }
+}
+poll()
+setInterval(poll, 1000)
+
+// --- task-type override (P1-2) ---------------------------------------------
+el('task').addEventListener('change', async (e) => {
+  if (!current || !current.session) return
+  await fetch('/task-type', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: current.session.id, taskType: e.target.value }),
+  }).catch(() => {})
+  poll()
+})
+
+// --- editable daily budget (P0-5) ------------------------------------------
+el('budget').addEventListener('click', () => {
+  if (!current || !current.daily) return
+  const cur = (current.daily.budget_micros / 1e6).toFixed(2)
+  const input = document.createElement('input')
+  input.className = 'budget-input'; input.value = cur; input.type = 'number'; input.step = '0.5'; input.min = '0'
+  const span = el('budget')
+  span.replaceWith(input); input.focus(); input.select()
+  const commit = async () => {
+    const dollars = Number(input.value)
+    const micros = Number.isFinite(dollars) && dollars >= 0 ? Math.round(dollars * 1e6) : current.daily.budget_micros
+    await fetch('/budget', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ micros }),
+    }).catch(() => {})
+    input.replaceWith(span)
+    poll()
+  }
+  input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') commit(); if (ev.key === 'Escape') input.replaceWith(span) })
+  input.addEventListener('blur', commit)
+})
+
+// --- which-sessions popover --------------------------------------------------
+function relTime(iso) {
+  const sec = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
+  if (sec < 90) return 'now'
+  if (sec < 3600) return Math.round(sec / 60) + 'm'
+  return Math.round(sec / 3600) + 'h'
+}
+
+function renderSessPop(state) {
+  const rows = el('sessrows'); rows.replaceChildren()
+  const list = state.activeSessions || []
+  const drivingId = state.session && state.session.id
+  for (const a of list) {
+    const row = document.createElement('div')
+    row.className = 'srow' + (a.id === drivingId ? ' driving' : '')
+    const dot = document.createElement('span'); dot.className = 'sdot'
+    dot.title = a.id === drivingId ? 'drives the gauge' : ''
+    const model = document.createElement('span'); model.className = 'smodel'
+    model.textContent = a.source === 'proxy' ? (a.model || a.id) : (a.model || 'unknown')
+    const task = document.createElement('span'); task.className = 'stask'
+    task.textContent = a.task_type === 'unset' ? '' : a.task_type
+    const cost = document.createElement('span'); cost.className = 'scost'
+    cost.textContent = usd(a.cumulative_cost_micros)
+    const ago = document.createElement('span'); ago.className = 'sago'
+    ago.textContent = relTime(a.last_seen_at)
+    row.append(dot, model, task, cost, ago)
+    rows.appendChild(row)
+  }
+}
+
+el('sessions').addEventListener('click', (e) => {
+  e.stopPropagation()
+  const pop = el('sesspop')
+  pop.style.display = pop.style.display === 'block' ? 'none' : 'block'
+})
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.sess-pop, .sessions-pill')) el('sesspop').style.display = 'none'
+})
+
+// --- Tauri shell integration ------------------------------------------------
+// Native chrome (titleBarStyle Overlay) supplies the traffic lights; the page
+// switches to full-bleed layout and keeps drag-anywhere: any left-mousedown
+// that isn't on an interactive control starts a native window drag via IPC
+// (granted to this origin in the app's capability file). In a plain browser
+// __TAURI_INTERNALS__ is undefined and none of this runs.
+const tauri = window.__TAURI_INTERNALS__
+if (tauri && typeof tauri.invoke === 'function') {
+  document.body.classList.add('tauri-shell')
+  document.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return
+    if (e.target.closest('select, input, button, a, .budget-num')) return
+    tauri.invoke('plugin:window|start_dragging').catch(() => {})
+  })
+}
+
+// Dashboard: native window inside the app (also on the View menu / Cmd+D);
+// plain browser gets a new tab.
+el('dash').addEventListener('click', () => {
+  if (tauri && typeof tauri.invoke === 'function') {
+    tauri.invoke('open_dashboard_cmd').catch(() => window.open('/dashboard', '_blank'))
+  } else {
+    window.open('/dashboard', '_blank')
+  }
+})
+</script>
+</body>
+</html>

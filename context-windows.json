@@ -1,0 +1,38 @@
+{
+  "_readme": [
+    "Hand-maintained context window table (PRD Q2, P0-8). Values are total context window in tokens.",
+    "Keys are matched against the model id from the wire (e.g. 'claude-haiku-4-5-20251001') by",
+    "exact match first, then LONGEST PREFIX match. So 'claude-haiku-4-5' covers every dated build.",
+    "",
+    "A model with no entry resolves to UNKNOWN. That is deliberate: the gauge must show a token",
+    "count with no percentage and a gray dial rather than guess a window and render a wrong",
+    "percentage. Do not add a catch-all default here \u2014 that would defeat P0-8.",
+    "",
+    "VERIFY BEFORE TRUSTING: these are the standard published windows for each family. Two caveats.",
+    "(1) Sonnet 4 and 4.5 support a 1M-token window behind a beta header; if you enable it, the",
+    "effective window is 1000000 and the entry below is wrong for that session.",
+    "(2) Models newer than this file are intentionally absent rather than guessed. Add them once",
+    "you have confirmed the number from the docs, not from memory.",
+    "UPDATE 2026-08-23: current-generation models (Opus 4.6/4.7/4.8, Sonnet 4.6/5, Fable 5)",
+    "default to a 1M window per the Claude API docs and carry explicit keys above so they",
+    "never fall back to an older family's 200k prefix. Verified live: an Opus 4.8 session",
+    "read 37.8% against the wrong 200k prefix before these keys existed."
+  ],
+  "models": {
+    "claude-fable-5": 1000000,
+    "claude-opus-4": 200000,
+    "claude-opus-4-1": 200000,
+    "claude-sonnet-4": 200000,
+    "claude-sonnet-4-5": 200000,
+    "claude-haiku-4-5": 200000,
+    "claude-3-7-sonnet": 200000,
+    "claude-3-5-sonnet": 200000,
+    "claude-3-5-haiku": 200000,
+    "claude-3-opus": 200000,
+    "claude-opus-4-6": 1000000,
+    "claude-opus-4-7": 1000000,
+    "claude-opus-4-8": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    "claude-sonnet-5": 1000000
+  }
+}
