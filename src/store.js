@@ -65,6 +65,17 @@ const ALLOW = {
 const MAIN_THREAD_SOURCES = new Set(['main', 'repl_main_thread'])
 
 /**
+ * Upper edges (exclusive) for the per-request context-fit buckets — the primary
+ * analytical axis (replaces the subjective per-session task label). A request's
+ * context_tokens falls in bucket i if it is < CTX_BUCKET_EDGES[i]; anything
+ * >= the last edge lands in the final overflow bucket (index === edges.length).
+ * The thresholds map to real local-model windows: 32K/128K are common 24–35B
+ * ceilings, 200K is the Claude default, 1M is frontier. Integer literals, so
+ * they are injection-safe when interpolated into the bucketing CASE.
+ */
+const CTX_BUCKET_EDGES = [32000, 128000, 200000, 1000000]
+
+/**
  * Known identity fields. NOT used for filtering — the allowlist above does the
  * filtering. This list exists only as a tripwire: if one of these ever makes it
  * into a value being written, something has gone badly wrong and we want a
@@ -140,6 +151,17 @@ function localDate(iso) {
   const t = Number.isNaN(d.getTime()) ? new Date() : d
   const p = (n) => String(n).padStart(2, '0')
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())}`
+}
+
+/**
+ * Compact human label for a token count on a bucket edge: 32000 → '32K',
+ * 1000000 → '1M'. Only ever fed the CTX_BUCKET_EDGES literals, so the cases
+ * are exhaustive for our use; falls back to the raw number otherwise.
+ */
+function fmtK(n) {
+  if (n >= 1000000) return `${n / 1000000}M`
+  if (n >= 1000) return `${n / 1000}K`
+  return String(n)
 }
 
 // ---------------------------------------------------------------------------
@@ -700,9 +722,87 @@ class Store {
                   FROM requests WHERE local_date >= ?`)
       .get(from)
 
+    // Daily cost stacked by SOURCE (objective) rather than task label. The
+    // daily trend is still useful; only its old stacking axis (task_type) was
+    // broken. source+provider ('claude-code' / 'proxy'+'openai' / 'proxy'+'local'…)
+    // is a fact off the wire, not a guess.
+    const dailyBySource = this.db
+      .prepare(`SELECT r.local_date, r.source, r.provider,
+                       SUM(r.cost_micros) AS cost_micros, COUNT(*) AS requests
+                  FROM requests r WHERE r.local_date >= ?
+                 GROUP BY r.local_date, r.source, r.provider`)
+      .all(from)
+
+    // PRIMARY axis — per-request context-fit distribution. Every request is
+    // bucketed by its own context_tokens; we report BOTH request count and cost
+    // per bucket (a few huge-context requests can dominate spend while most
+    // requests sit small). Objective, label-free, works on existing data.
+    // Counts ALL requests (main + subagent + aux): every model round-trip is
+    // real work carrying its own context. (A main-thread-only variant would add
+    //   AND query_source IN ('main','repl_main_thread')
+    // — not built now.)
+    const bucketExpr =
+      'CASE ' +
+      CTX_BUCKET_EDGES.map((e, i) => `WHEN context_tokens < ${e} THEN ${i}`).join(' ') +
+      ` ELSE ${CTX_BUCKET_EDGES.length} END`
+    const contextFitRows = this.db
+      .prepare(`SELECT ${bucketExpr} AS bucket,
+                       COUNT(*) AS requests,
+                       COALESCE(SUM(cost_micros),0) AS cost_micros,
+                       COALESCE(SUM(output_tokens),0) AS output_tokens
+                  FROM requests WHERE local_date >= ?
+                 GROUP BY bucket ORDER BY bucket`)
+      .all(from)
+    // Densify to all N+1 buckets (emit empties) so the chart axis is stable
+    // across date ranges, and attach a human label per bucket.
+    const ctxLabels = [
+      ...CTX_BUCKET_EDGES.map((e, i) => `${i === 0 ? '0' : fmtK(CTX_BUCKET_EDGES[i - 1])}–${fmtK(e)}`),
+      `>${fmtK(CTX_BUCKET_EDGES[CTX_BUCKET_EDGES.length - 1])}`,
+    ]
+    const byBucket = Object.fromEntries(contextFitRows.map((r) => [r.bucket, r]))
+    const contextFit = ctxLabels.map((label, i) => ({
+      bucket: i,
+      label,
+      requests: byBucket[i] ? byBucket[i].requests : 0,
+      cost_micros: byBucket[i] ? byBucket[i].cost_micros : 0,
+      output_tokens: byBucket[i] ? byBucket[i].output_tokens : 0,
+    }))
+
+    // SECONDARY — period token anatomy. One row, four numbers: what the token
+    // spend is actually made of. Makes the cheap-cache-read majority visible
+    // (the largest hidden factor in coding-agent cost, PRD goal #2).
+    const tokenAnatomy = this.db
+      .prepare(`SELECT COALESCE(SUM(input_tokens),0)          AS fresh_input,
+                       COALESCE(SUM(cache_read_tokens),0)     AS cache_read,
+                       COALESCE(SUM(cache_creation_tokens),0) AS cache_creation,
+                       COALESCE(SUM(output_tokens),0)         AS output
+                  FROM requests WHERE local_date >= ?`)
+      .get(from)
+
+    // TERTIARY (PROXY, not truth) — agentic intensity as round-trips per user
+    // prompt. Rests on the verified fact that Claude Code reuses one prompt.id
+    // across the api_requests of a turn's tool loop, so COUNT(*) GROUP BY
+    // prompt_id === model round-trips for one user ask. Claude Code only:
+    // proxy rows carry prompt_id = NULL and are excluded. If the wire ever
+    // stopped reusing prompt.id this degrades to all-ones (honest, not faked).
+    const agenticIntensity = this.db
+      .prepare(`SELECT rt.round_trips,
+                       COUNT(*)             AS prompts,
+                       SUM(rt.cost_micros)  AS cost_micros
+                  FROM (SELECT prompt_id,
+                               COUNT(*)          AS round_trips,
+                               SUM(cost_micros)  AS cost_micros
+                          FROM requests
+                         WHERE local_date >= ? AND source = 'claude-code'
+                           AND prompt_id IS NOT NULL
+                         GROUP BY prompt_id) rt
+                 GROUP BY rt.round_trips ORDER BY rt.round_trips`)
+      .all(from)
+
     return {
       days: d, from, to: dates[dates.length - 1], dates,
-      dailyByTask, byTask, byModel, totals,
+      dailyByTask, dailyBySource, byTask, byModel, totals,
+      contextFit, tokenAnatomy, agenticIntensity, ctxBucketEdges: CTX_BUCKET_EDGES,
       today: this.getDaily(),
       budget_micros: int(this.getSetting('daily_budget_micros'), 0),
     }
@@ -728,7 +828,8 @@ class Store {
 module.exports = {
   Store,
   MAIN_THREAD_SOURCES,
+  CTX_BUCKET_EDGES,
   // exported for tests
-  int, bool, localDate, pick, assertNoPii, resolveContextWindow,
+  int, bool, localDate, fmtK, pick, assertNoPii, resolveContextWindow,
   loadContextWindows, ALLOW, KNOWN_PII,
 }

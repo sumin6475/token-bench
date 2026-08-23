@@ -40,7 +40,7 @@ I want to become someone who can move a workflow to a local model on judgment, n
 2. **Build intuition about cache.** Make the split between cached and fresh tokens visible, since that is the largest hidden factor in coding-agent cost.
 3. **Know today's spend without asking.** Cumulative cost against a self-set budget, always visible.
 4. **Cover both paths with one widget.** Claude Code CLI and API-key tools feed the same display.
-5. **Establish a local-model baseline.** After two weeks of use, I can say which of my four task types would survive on a local model.
+5. **Establish a local-model baseline.** After two weeks of use, I can say **what share of my requests could a local model even hold, and where my cost concentrates by context size** — measured per request, not by a manual label. *(Reframed 2026-08-23: the original wording — "which of my four task types would survive on a local model" — rested on a per-session task label that turned out to be the weakest axis. The objective per-request context-fit distribution replaced it; see `docs/journal/2026-08-23-local-model-viability.md`.)*
 
 ---
 
@@ -326,7 +326,7 @@ Mockup approved 2026-08-19.
 Not adoption metrics — this is a tool for one person. Success is:
 
 1. Within one week, I can predict roughly where the needle will sit before starting a task.
-2. Within two weeks, I have data to answer: which of my four task types has a context profile a local model could handle.
+2. Within two weeks, I have data to answer: what fraction of my requests fit a local context window, and in which context band my cost concentrates. *(Reframed 2026-08-23 — see Goal #5.)*
 3. I notice at least one habit I want to change (a context I let grow too long, a model I over-reach for).
 4. The widget runs for a full working day without me thinking about it.
 

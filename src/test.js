@@ -18,7 +18,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
-const { Store, int, bool, localDate, resolveContextWindow } = require('./store.js')
+const { Store, int, bool, localDate, resolveContextWindow, CTX_BUCKET_EDGES } = require('./store.js')
 const { loadPricing, resolvePricing, computeCostMicros } = require('./pricing.js')
 
 let passed = 0
@@ -692,6 +692,71 @@ test('getDashboardData: daily-by-task, by-model, totals agree on one slice', () 
   const sumDaily = d.dailyByTask.reduce((a, r) => a + r.cost_micros, 0)
   assert.strictEqual(sumTask, d.totals.cost_micros)
   assert.strictEqual(sumDaily, d.totals.cost_micros)
+  s.close()
+})
+
+console.log('\ncontext-fit + token anatomy (primary axis)')
+
+test('context-fit bucket boundaries: strict < edge semantics', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const now = new Date().toISOString()
+  // ctx = input (+0 cache); assert each lands per `context_tokens < edge`.
+  const cases = [
+    [31999, 0], [32000, 1], [128000, 2], [199999, 2], [200000, 3], [1000000, 4], [1000001, 4],
+  ]
+  cases.forEach(([ctx], i) =>
+    s.ingest(req({
+      request_id: 'b' + i, 'prompt.id': 'pb' + i, 'event.timestamp': now,
+      input_tokens: ctx, cache_read_tokens: 0, cache_creation_tokens: 0,
+    })))
+  const d = s.getDashboardData(7)
+  const want = { 0: 1, 1: 1, 2: 2, 3: 1, 4: 2 }  // 128000 & 199999 both → bucket 2; 1000000 & 1000001 → bucket 4
+  for (const b of d.contextFit) assert.strictEqual(b.requests, want[b.bucket] || 0, `bucket ${b.bucket} (${b.label})`)
+  s.close()
+})
+
+test('contextFit + tokenAnatomy reconcile with totals (incl. proxy rows)', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const now = new Date().toISOString()
+  s.ingest(req({
+    request_id: 'r1', 'prompt.id': 'p1', 'event.timestamp': now,
+    input_tokens: 1000, cache_read_tokens: 5000, cache_creation_tokens: 200, output_tokens: 300,
+  }))
+  s.ingestProxyRequest({
+    requestId: 'r2', provider: 'openai', model: 'gpt-4o',
+    inputTokens: 2000, cacheReadTokens: 0, cacheCreationTokens: 0, outputTokens: 400, ts: now,
+  })
+  const d = s.getDashboardData(7)
+  assert.strictEqual(d.contextFit.length, CTX_BUCKET_EDGES.length + 1, 'N+1 densified buckets')
+  assert.strictEqual(d.contextFit.reduce((a, b) => a + b.requests, 0), d.totals.requests, 'request counts sum to totals')
+  assert.strictEqual(d.contextFit.reduce((a, b) => a + b.cost_micros, 0), d.totals.cost_micros, 'cost sums to totals')
+  const a = d.tokenAnatomy
+  assert.strictEqual(a.fresh_input + a.cache_read + a.cache_creation, d.totals.in_tokens, 'anatomy in-tokens = totals.in_tokens')
+  assert.strictEqual(a.output, d.totals.output_tokens, 'anatomy output = totals.output_tokens')
+  s.close()
+})
+
+test('agenticIntensity: round-trips = requests sharing a prompt_id (Claude Code only)', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const now = new Date().toISOString()
+  // Two api_requests of ONE user prompt's tool loop (same prompt.id).
+  s.ingest(req({ request_id: 'a1', 'prompt.id': 'shared', 'event.sequence': 1, 'event.timestamp': now, query_source: 'repl_main_thread' }))
+  s.ingest(req({ request_id: 'a2', 'prompt.id': 'shared', 'event.sequence': 2, 'event.timestamp': now, query_source: 'repl_main_thread' }))
+  // A separate single-round-trip prompt.
+  s.ingest(req({ request_id: 'a3', 'prompt.id': 'solo', 'event.sequence': 3, 'event.timestamp': now, query_source: 'repl_main_thread' }))
+  // Proxy row has prompt_id NULL → must be excluded.
+  s.ingestProxyRequest({ requestId: 'px', provider: 'openai', model: 'gpt-4o', inputTokens: 10, outputTokens: 5, ts: now })
+
+  const d = s.getDashboardData(7)
+  const two = d.agenticIntensity.find((r) => r.round_trips === 2)
+  const one = d.agenticIntensity.find((r) => r.round_trips === 1)
+  assert.ok(two && two.prompts === 1, 'one prompt drove 2 round-trips')
+  assert.ok(one && one.prompts === 1, 'one prompt drove 1 round-trip')
+  const totalPrompts = d.agenticIntensity.reduce((a, r) => a + r.prompts, 0)
+  assert.strictEqual(totalPrompts, 2, 'proxy row (null prompt_id) excluded — only 2 Claude Code prompts')
   s.close()
 })
 

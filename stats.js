@@ -12,7 +12,7 @@
  */
 
 const path = require('node:path')
-const { Store, localDate, MAIN_THREAD_SOURCES } = require('./src/store.js')
+const { Store, localDate, MAIN_THREAD_SOURCES, CTX_BUCKET_EDGES, fmtK } = require('./src/store.js')
 
 const argv = process.argv.slice(2)
 const arg = (flag, fallback) => {
@@ -111,9 +111,66 @@ if (bySource.length) {
   }
 }
 
-// --- by task type -----------------------------------------------------------
-// The payoff for labeling sessions: cost and volume per KIND of work — the
-// data that eventually answers "which of my task types could run locally".
+// --- by context fit (PRIMARY axis) -----------------------------------------
+// Objective, per-request: what share of requests (and of cost) falls in each
+// context-size band. Answers "what could a local model even hold" with no
+// labels. Bucket edges are the shared CTX_BUCKET_EDGES (integer literals →
+// injection-safe in the CASE).
+
+const ctxBucketExpr =
+  'CASE ' +
+  CTX_BUCKET_EDGES.map((e, i) => `WHEN context_tokens < ${e} THEN ${i}`).join(' ') +
+  ` ELSE ${CTX_BUCKET_EDGES.length} END`
+const ctxRows = store.db
+  .prepare(`SELECT ${ctxBucketExpr} AS bucket, COUNT(*) AS nreq,
+                   SUM(cost_micros) AS cost, MAX(context_tokens) AS peak
+              FROM requests WHERE local_date = ? GROUP BY bucket ORDER BY bucket`)
+  .all(day)
+
+if (ctxRows.length) {
+  const ctxLabels = [
+    ...CTX_BUCKET_EDGES.map((e, i) => `${i === 0 ? '0' : fmtK(CTX_BUCKET_EDGES[i - 1])}–${fmtK(e)}`),
+    `>${fmtK(CTX_BUCKET_EDGES[CTX_BUCKET_EDGES.length - 1])}`,
+  ]
+  const totReq = ctxRows.reduce((a, r) => a + r.nreq, 0) || 1
+  const totCost = ctxRows.reduce((a, r) => a + r.cost, 0) || 1
+  console.log('')
+  console.log(bold('  By context fit') + dim(`  (${day}, per-request context size)`))
+  for (const r of ctxRows) {
+    const reqPct = ((r.nreq / totReq) * 100).toFixed(0)
+    const costPct = ((r.cost / totCost) * 100).toFixed(0)
+    console.log(
+      `    ${ctxLabels[r.bucket].padEnd(11)} ${String(r.nreq).padStart(4)} req (${reqPct.padStart(3)}%)` +
+        `   ${usd(r.cost).padStart(10)} (${costPct.padStart(3)}%)`
+    )
+  }
+}
+
+// --- token anatomy ---------------------------------------------------------
+// What the token spend is actually made of. The cache-read majority is the
+// point (largest hidden factor in coding-agent cost).
+
+const anat = store.db
+  .prepare(`SELECT COALESCE(SUM(input_tokens),0) AS fresh, COALESCE(SUM(cache_read_tokens),0) AS cread,
+                   COALESCE(SUM(cache_creation_tokens),0) AS cwrite, COALESCE(SUM(output_tokens),0) AS out
+              FROM requests WHERE local_date = ?`)
+  .get(day)
+
+const anatTot = anat.fresh + anat.cread + anat.cwrite + anat.out
+if (anatTot > 0) {
+  const pct = (v) => `${((v / anatTot) * 100).toFixed(1)}%`
+  console.log('')
+  console.log(bold('  Token anatomy') + dim(`  (${day}, ${n(anatTot)} tokens)`))
+  console.log(
+    `    fresh ${pct(anat.fresh).padStart(6)}   cache-read ${pct(anat.cread).padStart(6)}` +
+      `   cache-write ${pct(anat.cwrite).padStart(6)}   output ${pct(anat.out).padStart(6)}`
+  )
+}
+
+// --- by task type (SECONDARY lens) -----------------------------------------
+// Kept as an optional lens. A single session spans many kinds of work, so this
+// manual per-session label is a rough tag — the context-fit axis above is the
+// objective view.
 
 const byTask = store.db
   .prepare(`SELECT s.task_type, COUNT(*) AS n, SUM(r.cost_micros) AS cost,
