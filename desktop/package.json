@@ -1,7 +1,7 @@
 {
   "name": "tokenbench-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tauri shell for the TokenBench widget",
   "scripts": {
     "tauri": "tauri",
