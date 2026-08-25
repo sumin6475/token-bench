@@ -47,7 +47,7 @@
   header .live { margin-left: auto; font-size: 11px; color: var(--muted); }
 
   /* One filter row above everything it scopes. Date range first. */
-  .filters { display: flex; gap: 6px; margin-bottom: 16px; }
+  .filters { display: flex; gap: 6px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
   .filters button {
     background: var(--surface); color: var(--text-2);
     border: 1px solid var(--line); border-radius: 8px;
@@ -56,6 +56,7 @@
   .filters button:hover { color: var(--text); }
   .filters button.on { color: var(--text); border-color: var(--baseline); }
   .filters button.on::before { content: "✓ "; font-weight: 700; color: var(--teal); }
+  .filters #sessionchip { margin-left: auto; }
 
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 14px; }
   .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
@@ -108,6 +109,25 @@
   .mval .unp { color: var(--amber); }
   .mval .n { color: var(--muted); }
 
+  /* Sessions: same card language as by-model rows, with a context-fill track
+     (level, not a sum) and a thin input-anatomy strip. */
+  #sessions { max-height: 320px; overflow-y: auto; }
+  .sess {
+    display: grid; grid-template-columns: minmax(150px, 210px) minmax(140px, 1fr) auto;
+    gap: 12px; align-items: center;
+    padding: 8px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .sess:hover { background: rgba(255,255,255,.03); }
+  .sess.on { border-color: var(--baseline); background: rgba(45,212,191,.08); }
+  .sess .sname { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess .smeta { font-size: 10px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess .sfill { height: 10px; border-radius: 4px; background: var(--page); overflow: hidden; }
+  .sess .sfill > i { display: block; height: 100%; border-radius: 4px; min-width: 0; }
+  .sess .slbl { font-size: 10px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .sess .sval { font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; text-align: right; }
+  .sess .sval .n { color: var(--muted); font-size: 11px; }
+
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th { text-align: right; color: var(--muted); font-weight: 500; font-size: 11px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
   th:first-child, td:first-child { text-align: left; }
@@ -150,11 +170,19 @@
   <button data-days="7" class="on">7 days</button>
   <button data-days="14">14 days</button>
   <button data-days="30">30 days</button>
+  <button id="sessionchip" class="on" hidden></button>
 </div>
 
 <div class="kpis" id="kpis"></div>
 
 <div class="grid">
+  <!-- Sessions: operational index. Click a row to scope every chart below. -->
+  <div class="card">
+    <h2>Sessions</h2>
+    <div class="hint">each conversation's context fill — a level, not a running sum. click a row to inspect it</div>
+    <div id="sessions"></div>
+    <details><summary>View as table</summary><div id="sessiontable"></div></details>
+  </div>
   <!-- HERO: the local-viability answer, measured, label-free -->
   <div class="card">
     <div class="card-head">
@@ -261,14 +289,16 @@ function emptyMsg(host, msg) {
 }
 
 let days = 7
+let sessionId = null
 let data = null
 let firstLoad = true
 
 async function load() {
-  const plots = document.querySelectorAll('.plot, #models, #ctxfit, #anatomy, #agentic, #tasktable')
+  const plots = document.querySelectorAll('.plot, #models, #ctxfit, #anatomy, #agentic, #tasktable, #sessions')
   if (!firstLoad) plots.forEach(p => p.classList.add('loading'))
   try {
-    const r = await fetch('/dashboard-data?days=' + days, { cache: 'no-store' })
+    const q = '/dashboard-data?days=' + days + (sessionId ? '&session=' + encodeURIComponent(sessionId) : '')
+    const r = await fetch(q, { cache: 'no-store' })
     data = await r.json()
     render()
     el('live').textContent = 'updated ' + new Date().toLocaleTimeString()
@@ -280,7 +310,10 @@ async function load() {
 // --- filters (scope everything below) ---------------------------------------
 el('filters').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return
-  document.querySelectorAll('#filters button').forEach(x => x.classList.toggle('on', x === b))
+  if (b.id === 'sessionchip') {
+    sessionId = null; firstLoad = true; load(); return
+  }
+  document.querySelectorAll('#filters button[data-days]').forEach(x => x.classList.toggle('on', x === b))
   days = Number(b.dataset.days); firstLoad = true; load()
 })
 
@@ -313,6 +346,7 @@ const hideTip = () => { tip.style.display = 'none' }
 function render() {
   if (!data || data.store === false) return
   renderKpis()
+  renderSessions()
   renderContextFit()
   renderTokenAnatomy()
   renderModels()
@@ -328,12 +362,17 @@ function renderKpis() {
   // "local-fit" share = requests whose context is < 128K (buckets 0 and 1).
   const le128 = data.contextFit.filter(b => b.bucket <= 1).reduce((a, b) => a + b.requests, 0)
   const pctLocal = data.totals.requests ? Math.round(le128 / data.totals.requests * 100) : 0
+  const range = data.days === 1 ? 'day' : data.days + ' days'
   const tiles = [
-    { lbl: `Cost · last ${data.days === 1 ? 'day' : data.days + ' days'}`, val: usdC(data.totals.cost_micros) },
+    { lbl: sessionId ? 'Cost · this session' : `Cost · last ${range}`,
+      val: usdC(data.totals.cost_micros),
+      sub: sessionId ? `of last ${range}` : null },
     { lbl: 'Today vs budget', val: usdC(data.today.cost_micros),
       sub: bf === null ? 'no budget set'
         : `${(bf*100).toFixed(0)}% of ${usdC(data.budget_micros)}`,
       cls: bf === null ? '' : bf >= 1 ? 'over' : bf >= 0.85 ? 'warn' : '' },
+    { lbl: 'Sessions', val: String((data.bySession || []).length),
+      sub: sessionId ? 'inspecting 1 · click the chip to clear' : 'in this range' },
     { lbl: 'Requests ≤128K (local-fit)', val: pctLocal + '%',
       sub: `${nf.format(le128)} of ${nf.format(data.totals.requests)} requests` },
     { lbl: 'Tokens in → out', val: `${tok(data.totals.in_tokens)} → ${tok(data.totals.output_tokens)}` },
@@ -350,6 +389,142 @@ function renderKpis() {
     }
     k.appendChild(d)
   }
+}
+
+// --- sessions: one row per conversation, context as a LEVEL -----------------
+function shortId(id) {
+  if (!id) return '—'
+  if (id.startsWith('proxy:')) return (id.split(':')[1] || id)
+  return id.slice(0, 8)
+}
+function sessSource(s) {
+  if (s.source === 'claude-code') return 'claude-code'
+  return s.provider || s.source
+}
+function relTime(iso) {
+  const sec = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
+  if (sec < 90) return 'now'
+  if (sec < 3600) return Math.round(sec / 60) + 'm ago'
+  if (sec < 86400) return Math.round(sec / 3600) + 'h ago'
+  const d = new Date(iso)
+  return `${d.getMonth() + 1}/${d.getDate()}`
+}
+function gaugeColor(frac) {
+  if (frac == null) return 'var(--muted)'
+  if (frac >= 0.85) return 'var(--red)'
+  if (frac >= 0.60) return 'var(--amber)'
+  return 'var(--teal)'
+}
+
+function renderSessions() {
+  const host = el('sessions'); host.replaceChildren()
+  const chip = el('sessionchip')
+  const list = data.bySession || []
+  if (sessionId) {
+    chip.hidden = false
+    chip.textContent = 'session ' + shortId(sessionId)
+  } else {
+    chip.hidden = true
+  }
+
+  if (!list.length) {
+    emptyMsg(host); el('sessiontable').replaceChildren(); return
+  }
+
+  for (const s of list) {
+    const row = document.createElement('div')
+    row.className = 'sess' + (s.id === sessionId ? ' on' : '')
+    row.setAttribute('role', 'button')
+    row.tabIndex = 0
+
+    const left = document.createElement('div')
+    const name = document.createElement('div'); name.className = 'sname'
+    name.textContent = s.model || 'unknown'
+    const meta = document.createElement('div'); meta.className = 'smeta'
+    const bits = [shortId(s.id), sessSource(s), nf.format(s.requests) + ' req']
+    if (s.compaction_count) bits.push(s.compaction_count + ' compact')
+    bits.push(relTime(s.last_seen_at))
+    meta.textContent = bits.join(' · ')
+    left.append(name, meta)
+
+    const mid = document.createElement('div')
+    const fill = document.createElement('div'); fill.className = 'sfill'
+    const bar = document.createElement('i')
+    const frac = s.gaugePercent
+    bar.style.width = frac != null ? Math.min(100, Math.max(0, frac * 100)) + '%' : '0'
+    bar.style.background = gaugeColor(frac)
+    fill.appendChild(bar)
+
+    const inTot = s.fresh_input + s.cache_read + s.cache_creation
+    const slbl = document.createElement('div'); slbl.className = 'slbl'
+    if (s.latest_context_tokens == null) {
+      slbl.textContent = 'no main-thread request yet'
+    } else if (frac == null) {
+      slbl.textContent = tok(s.latest_context_tokens) + (s.peak_context && s.peak_context !== s.latest_context_tokens ? ' · peak ' + tok(s.peak_context) : '')
+    } else {
+      slbl.textContent =
+        tok(s.latest_context_tokens) + ' / ' + tok(s.contextWindow) +
+        ' · ' + Math.round(frac * 100) + '%' +
+        (s.peak_context && s.peak_context !== s.latest_context_tokens ? ' · peak ' + tok(s.peak_context) : '')
+    }
+    mid.append(fill, slbl)
+
+    const right = document.createElement('div'); right.className = 'sval'
+    if (s.provider === 'local') {
+      right.textContent = tok(s.output) + ' tok'
+    } else {
+      right.textContent = usd(s.cost_micros)
+    }
+    if (inTot > 0) {
+      const n = document.createElement('div'); n.className = 'n'
+      n.textContent = Math.round(s.cache_read / inTot * 100) + '% cache'
+      right.appendChild(n)
+    }
+
+    row.append(left, mid, right)
+    const pick = () => {
+      sessionId = sessionId === s.id ? null : s.id
+      firstLoad = true
+      load()
+    }
+    row.addEventListener('click', pick)
+    row.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick() }
+    })
+    row.addEventListener('pointermove', (ev) => {
+      const rows = [
+        { color: gaugeColor(frac), name: 'context now',
+          value: s.latest_context_tokens == null ? '—' : tok(s.latest_context_tokens) },
+        { color: 'transparent', name: 'peak', value: s.peak_context ? tok(s.peak_context) : '—' },
+        { color: ANATOMY[0].color, name: 'fresh input', value: tok(s.fresh_input) },
+        { color: ANATOMY[1].color, name: 'cache read', value: tok(s.cache_read) },
+        { color: ANATOMY[2].color, name: 'cache write', value: tok(s.cache_creation) },
+        { color: 'transparent', name: 'requests', value: nf.format(s.requests) },
+      ]
+      showTip(ev.clientX, ev.clientY, s.model || shortId(s.id), rows, usd(s.cost_micros))
+    })
+    row.addEventListener('pointerleave', hideTip)
+    host.appendChild(row)
+  }
+
+  const tbl = document.createElement('table')
+  const head = tbl.insertRow()
+  for (const h of ['Session', 'Model', 'Source', 'Req', 'Context', 'Peak', 'Cache', 'Cost']) {
+    const th = document.createElement('th'); th.textContent = h; head.appendChild(th)
+  }
+  for (const s of list) {
+    const tr = tbl.insertRow()
+    tr.insertCell().textContent = shortId(s.id)
+    tr.insertCell().textContent = s.model || 'unknown'
+    tr.insertCell().textContent = sessSource(s)
+    tr.insertCell().textContent = nf.format(s.requests)
+    tr.insertCell().textContent = s.latest_context_tokens == null ? '—' : tok(s.latest_context_tokens)
+    tr.insertCell().textContent = s.peak_context ? tok(s.peak_context) : '—'
+    const inTot = s.fresh_input + s.cache_read + s.cache_creation
+    tr.insertCell().textContent = inTot ? Math.round(s.cache_read / inTot * 100) + '%' : '—'
+    tr.insertCell().textContent = usd(s.cost_micros)
+  }
+  el('sessiontable').replaceChildren(tbl)
 }
 
 // --- HERO: context-fit — two 100% stacked horizontal bars -------------------

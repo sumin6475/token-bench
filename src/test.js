@@ -18,7 +18,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
-const { Store, int, bool, localDate, resolveContextWindow, CTX_BUCKET_EDGES } = require('./store.js')
+const { Store, int, bool, localDate, resolveContextWindow, loadContextWindows, CTX_BUCKET_EDGES } = require('./store.js')
 const { loadPricing, resolvePricing, computeCostMicros } = require('./pricing.js')
 
 let passed = 0
@@ -391,6 +391,18 @@ test('unknown model resolves to null, never a guess', () => {
   assert.strictEqual(resolveContextWindow('some-local-llama-7b', { 'claude-haiku-4-5': 200000 }), null)
 })
 
+test('z-ai/glm-5.3 resolves to 1M from the shipped window table', () => {
+  const w = loadContextWindows()
+  assert.strictEqual(resolveContextWindow('z-ai/glm-5.3', w), 1000000)
+  assert.strictEqual(resolveContextWindow('glm-5.3', w), 1000000)
+})
+
+test('kimi-k3 wire ids resolve to 1M from the shipped window table', () => {
+  const w = loadContextWindows()
+  assert.strictEqual(resolveContextWindow('kimi-k3', w), 1000000)
+  assert.strictEqual(resolveContextWindow('moonshotai/kimi-k3', w), 1000000)
+})
+
 test('unknown model yields no gauge percentage', () => {
   const db = tmpDb()
   const s = new Store(db)
@@ -422,6 +434,8 @@ test('resolvePricing matches by longest prefix, current models beat old ones', (
   // the trap: opus-4-8 must NOT fall back to the cheaper-prefix 'claude-opus-4' ($15/$75)
   assert.deepStrictEqual(resolvePricing('claude-opus-4-8', models), { input: 5, output: 25 })
   assert.deepStrictEqual(resolvePricing('claude-opus-4-20250514', models), { input: 15, output: 75 })
+  assert.deepStrictEqual(resolvePricing('kimi-k3', models), { input: 3, output: 15 })
+  assert.deepStrictEqual(resolvePricing('moonshotai/kimi-k3', models), { input: 3, output: 15 })
 })
 
 test('unknown model prices as unknown, never guessed', () => {
@@ -692,6 +706,64 @@ test('getDashboardData: daily-by-task, by-model, totals agree on one slice', () 
   const sumDaily = d.dailyByTask.reduce((a, r) => a + r.cost_micros, 0)
   assert.strictEqual(sumTask, d.totals.cost_micros)
   assert.strictEqual(sumDaily, d.totals.cost_micros)
+  s.close()
+})
+
+test('bySession: one row per session, context is a level not a sum', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const now = new Date().toISOString()
+  s.ingest(req({
+    'session.id': 'sess-a', request_id: 'a1', 'prompt.id': 'pa1',
+    'event.sequence': 1, 'event.timestamp': now, query_source: 'repl_main_thread',
+    input_tokens: 100, cache_read_tokens: 5000, cache_creation_tokens: 0,
+  }))
+  s.ingest(req({
+    'session.id': 'sess-a', request_id: 'a2', 'prompt.id': 'pa2',
+    'event.sequence': 2, 'event.timestamp': now, query_source: 'repl_main_thread',
+    input_tokens: 100, cache_read_tokens: 8000, cache_creation_tokens: 0,
+  }))
+  s.ingest(req({
+    'session.id': 'sess-b', request_id: 'b1', 'prompt.id': 'pb1',
+    'event.sequence': 1, 'event.timestamp': now, query_source: 'repl_main_thread',
+    input_tokens: 200, cache_read_tokens: 0, cache_creation_tokens: 0,
+  }))
+
+  const d = s.getDashboardData(7)
+  assert.strictEqual(d.bySession.length, 2)
+  assert.strictEqual(d.bySession.reduce((a, r) => a + r.requests, 0), d.totals.requests)
+  assert.strictEqual(d.bySession.reduce((a, r) => a + r.cost_micros, 0), d.totals.cost_micros)
+
+  const a = d.bySession.find((r) => r.id === 'sess-a')
+  assert.ok(a)
+  assert.strictEqual(a.requests, 2)
+  assert.strictEqual(a.latest_context_tokens, 8100, 'level = last main-thread context, not a sum')
+  assert.notStrictEqual(a.latest_context_tokens, 100 + 5000 + 100 + 8000)
+  assert.strictEqual(a.peak_context, 8100)
+  assert.strictEqual(a.fresh_input, 200)
+  assert.strictEqual(a.cache_read, 13000)
+  s.close()
+})
+
+test('sessionId scopes aggregates; bySession stays the full date-range list', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const now = new Date().toISOString()
+  s.ingest(req({
+    'session.id': 'keep', request_id: 'k1', 'prompt.id': 'pk',
+    'event.timestamp': now, cost_usd_micros: 1000,
+  }))
+  s.ingest(req({
+    'session.id': 'other', request_id: 'o1', 'prompt.id': 'po',
+    'event.timestamp': now, cost_usd_micros: 5000,
+  }))
+
+  const scoped = s.getDashboardData(7, 'keep')
+  assert.strictEqual(scoped.sessionId, 'keep')
+  assert.strictEqual(scoped.totals.requests, 1)
+  assert.strictEqual(scoped.totals.cost_micros, 1000)
+  assert.strictEqual(scoped.bySession.length, 2, 'picker list is not narrowed')
+  assert.strictEqual(scoped.contextFit.reduce((a, b) => a + b.requests, 0), 1)
   s.close()
 })
 

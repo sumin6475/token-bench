@@ -269,8 +269,10 @@ function serveDashboardData(res, url) {
   res.writeHead(200, { 'content-type': 'application/json' })
   if (!store) return res.end(JSON.stringify({ store: false }))
   try {
-    const days = Number(new URL(url, 'http://x').searchParams.get('days')) || 14
-    res.end(JSON.stringify({ store: true, ...store.getDashboardData(days) }))
+    const params = new URL(url, 'http://x').searchParams
+    const days = Number(params.get('days')) || 14
+    const session = params.get('session') || null
+    res.end(JSON.stringify({ store: true, ...store.getDashboardData(days, session) }))
   } catch (e) {
     res.end(JSON.stringify({ store: true, error: e.message }))
   }

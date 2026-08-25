@@ -672,23 +672,30 @@ class Store {
   }
 
   /**
-   * Dashboard aggregates (the app's identity: task-aware cost). One call, one
-   * JSON payload: daily cost stacked by task type, per-task totals, per-model
-   * totals — all scoped to the last `days` LOCAL dates so every chart and tile
-   * agrees on the same slice.
+   * Dashboard aggregates. One call, one JSON payload. Charts and tiles agree
+   * on the same slice: last `days` LOCAL dates, optionally one session.
+   *
+   * `bySession` is always the full session list for the date range (so the
+   * picker can switch). Everything else respects `sessionId` when set.
+   *
+   * Context on a session row is a LEVEL (latest_context_tokens), never a sum
+   * of request inputs — summing conversation-resend tokens is meaningless.
    */
-  getDashboardData(days = 14) {
+  getDashboardData(days = 14, sessionId = null) {
     const d = Math.max(1, Math.min(365, int(days, 14)))
+    const sid = sessionId ? str(sessionId) : null
     const dates = []
     const now = Date.now()
     for (let i = d - 1; i >= 0; i--) dates.push(localDate(new Date(now - i * 86400000).toISOString()))
     const from = dates[0]
+    const scope = sid ? 'r.local_date >= ? AND r.session_id = ?' : 'r.local_date >= ?'
+    const args = sid ? [from, sid] : [from]
 
     const dailyByTask = this.db
       .prepare(`SELECT r.local_date, s.task_type, SUM(r.cost_micros) AS cost_micros, COUNT(*) AS requests
                   FROM requests r JOIN sessions s ON s.id = r.session_id
-                 WHERE r.local_date >= ? GROUP BY r.local_date, s.task_type`)
-      .all(from)
+                 WHERE ${scope} GROUP BY r.local_date, s.task_type`)
+      .all(...args)
 
     const byTask = this.db
       .prepare(`SELECT s.task_type, COUNT(*) AS requests, COUNT(DISTINCT r.session_id) AS sessions,
@@ -698,8 +705,8 @@ class Store {
                        SUM(r.cache_creation_tokens) AS cache_creation_tokens,
                        MAX(r.context_tokens) AS peak_context
                   FROM requests r JOIN sessions s ON s.id = r.session_id
-                 WHERE r.local_date >= ? GROUP BY s.task_type ORDER BY cost_micros DESC`)
-      .all(from)
+                 WHERE ${scope} GROUP BY s.task_type ORDER BY cost_micros DESC`)
+      .all(...args)
 
     const byModel = this.db
       .prepare(`SELECT r.model, r.provider, r.source, COUNT(*) AS requests,
@@ -707,20 +714,20 @@ class Store {
                        SUM(r.input_tokens + r.cache_read_tokens + r.cache_creation_tokens) AS in_tokens,
                        SUM(r.output_tokens) AS output_tokens, SUM(r.duration_ms) AS duration_ms,
                        SUM(CASE WHEN r.cost_source = 'unknown' THEN 1 ELSE 0 END) AS unpriced
-                  FROM requests r WHERE r.local_date >= ?
+                  FROM requests r WHERE ${scope}
                  GROUP BY r.model, r.provider ORDER BY cost_micros DESC`)
-      .all(from)
+      .all(...args)
       .map((r) => ({
         ...r,
         toksPerSec: r.duration_ms > 0 ? Math.round((r.output_tokens / (r.duration_ms / 1000)) * 10) / 10 : null,
       }))
 
     const totals = this.db
-      .prepare(`SELECT COALESCE(SUM(cost_micros),0) AS cost_micros, COUNT(*) AS requests,
-                       COALESCE(SUM(output_tokens),0) AS output_tokens,
-                       COALESCE(SUM(input_tokens + cache_read_tokens + cache_creation_tokens),0) AS in_tokens
-                  FROM requests WHERE local_date >= ?`)
-      .get(from)
+      .prepare(`SELECT COALESCE(SUM(r.cost_micros),0) AS cost_micros, COUNT(*) AS requests,
+                       COALESCE(SUM(r.output_tokens),0) AS output_tokens,
+                       COALESCE(SUM(r.input_tokens + r.cache_read_tokens + r.cache_creation_tokens),0) AS in_tokens
+                  FROM requests r WHERE ${scope}`)
+      .get(...args)
 
     // Daily cost stacked by SOURCE (objective) rather than task label. The
     // daily trend is still useful; only its old stacking axis (task_type) was
@@ -729,9 +736,9 @@ class Store {
     const dailyBySource = this.db
       .prepare(`SELECT r.local_date, r.source, r.provider,
                        SUM(r.cost_micros) AS cost_micros, COUNT(*) AS requests
-                  FROM requests r WHERE r.local_date >= ?
+                  FROM requests r WHERE ${scope}
                  GROUP BY r.local_date, r.source, r.provider`)
-      .all(from)
+      .all(...args)
 
     // PRIMARY axis — per-request context-fit distribution. Every request is
     // bucketed by its own context_tokens; we report BOTH request count and cost
@@ -743,16 +750,16 @@ class Store {
     // — not built now.)
     const bucketExpr =
       'CASE ' +
-      CTX_BUCKET_EDGES.map((e, i) => `WHEN context_tokens < ${e} THEN ${i}`).join(' ') +
+      CTX_BUCKET_EDGES.map((e, i) => `WHEN r.context_tokens < ${e} THEN ${i}`).join(' ') +
       ` ELSE ${CTX_BUCKET_EDGES.length} END`
     const contextFitRows = this.db
       .prepare(`SELECT ${bucketExpr} AS bucket,
                        COUNT(*) AS requests,
-                       COALESCE(SUM(cost_micros),0) AS cost_micros,
-                       COALESCE(SUM(output_tokens),0) AS output_tokens
-                  FROM requests WHERE local_date >= ?
+                       COALESCE(SUM(r.cost_micros),0) AS cost_micros,
+                       COALESCE(SUM(r.output_tokens),0) AS output_tokens
+                  FROM requests r WHERE ${scope}
                  GROUP BY bucket ORDER BY bucket`)
-      .all(from)
+      .all(...args)
     // Densify to all N+1 buckets (emit empties) so the chart axis is stable
     // across date ranges, and attach a human label per bucket.
     const ctxLabels = [
@@ -772,12 +779,12 @@ class Store {
     // spend is actually made of. Makes the cheap-cache-read majority visible
     // (the largest hidden factor in coding-agent cost, PRD goal #2).
     const tokenAnatomy = this.db
-      .prepare(`SELECT COALESCE(SUM(input_tokens),0)          AS fresh_input,
-                       COALESCE(SUM(cache_read_tokens),0)     AS cache_read,
-                       COALESCE(SUM(cache_creation_tokens),0) AS cache_creation,
-                       COALESCE(SUM(output_tokens),0)         AS output
-                  FROM requests WHERE local_date >= ?`)
-      .get(from)
+      .prepare(`SELECT COALESCE(SUM(r.input_tokens),0)          AS fresh_input,
+                       COALESCE(SUM(r.cache_read_tokens),0)     AS cache_read,
+                       COALESCE(SUM(r.cache_creation_tokens),0) AS cache_creation,
+                       COALESCE(SUM(r.output_tokens),0)         AS output
+                  FROM requests r WHERE ${scope}`)
+      .get(...args)
 
     // TERTIARY (PROXY, not truth) — agentic intensity as round-trips per user
     // prompt. Rests on the verified fact that Claude Code reuses one prompt.id
@@ -789,19 +796,50 @@ class Store {
       .prepare(`SELECT rt.round_trips,
                        COUNT(*)             AS prompts,
                        SUM(rt.cost_micros)  AS cost_micros
-                  FROM (SELECT prompt_id,
+                  FROM (SELECT r.prompt_id,
                                COUNT(*)          AS round_trips,
-                               SUM(cost_micros)  AS cost_micros
-                          FROM requests
-                         WHERE local_date >= ? AND source = 'claude-code'
-                           AND prompt_id IS NOT NULL
-                         GROUP BY prompt_id) rt
+                               SUM(r.cost_micros)  AS cost_micros
+                          FROM requests r
+                         WHERE ${scope} AND r.source = 'claude-code'
+                           AND r.prompt_id IS NOT NULL
+                         GROUP BY r.prompt_id) rt
                  GROUP BY rt.round_trips ORDER BY rt.round_trips`)
+      .all(...args)
+
+    // Session list is the date-range census, never narrowed by the picker —
+    // otherwise you couldn't switch away from the session you just clicked.
+    const bySession = this.db
+      .prepare(`SELECT s.id, s.source, s.model, s.task_type,
+                       s.started_at, s.last_seen_at,
+                       s.latest_context_tokens, s.compaction_count,
+                       MAX(r.provider) AS provider,
+                       COUNT(*) AS requests,
+                       COALESCE(SUM(r.cost_micros),0) AS cost_micros,
+                       COALESCE(SUM(r.input_tokens),0) AS fresh_input,
+                       COALESCE(SUM(r.cache_read_tokens),0) AS cache_read,
+                       COALESCE(SUM(r.cache_creation_tokens),0) AS cache_creation,
+                       COALESCE(SUM(r.output_tokens),0) AS output,
+                       MAX(r.context_tokens) AS peak_context
+                  FROM requests r JOIN sessions s ON s.id = r.session_id
+                 WHERE r.local_date >= ?
+                 GROUP BY s.id
+                 ORDER BY s.last_seen_at DESC`)
       .all(from)
+      .map((row) => {
+        const win = resolveContextWindow(row.model, this.windows)
+        return {
+          ...row,
+          contextWindow: win,
+          gaugePercent: win && row.latest_context_tokens != null
+            ? row.latest_context_tokens / win
+            : null,
+          windowKnown: win !== null,
+        }
+      })
 
     return {
-      days: d, from, to: dates[dates.length - 1], dates,
-      dailyByTask, dailyBySource, byTask, byModel, totals,
+      days: d, from, to: dates[dates.length - 1], dates, sessionId: sid,
+      dailyByTask, dailyBySource, byTask, byModel, bySession, totals,
       contextFit, tokenAnatomy, agenticIntensity, ctxBucketEdges: CTX_BUCKET_EDGES,
       today: this.getDaily(),
       budget_micros: int(this.getSetting('daily_budget_micros'), 0),
