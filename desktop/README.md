@@ -81,7 +81,10 @@ npm run tauri icon path/to/your-icon.png
 3. **Transparency.** The window uses `macOSPrivateApi: true` for the rounded,
    frameless look. If a build ever rejects that, set `"transparent": false` in
    `tauri.conf.json` — the widget still works, just on a square panel.
-4. **Built and launched 2026-08-22.** First compile needed exactly one fix
+4. **Applies to any GUI app, but worth one line:** launch via
+   `open -a TokenBench` (or Finder/Dock) — running the binary directly from a
+   shell ties it to the terminal, and the app dies when that terminal closes.
+5. **Built and launched 2026-08-22.** First compile needed exactly one fix
    (the `macos-private-api` Cargo feature to match `macOSPrivateApi` in the
    config — already applied). Verified live: window opens always-on-top, the
    collector sidecar starts (`:4318`), the widget renders, and a real
