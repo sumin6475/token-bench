@@ -71,6 +71,23 @@ test('Codex token_count becomes usage metadata without prompt content', () => {
   assert.ok(!JSON.stringify(rec).includes('content'))
 })
 
+test('Codex retains its exact context window when a later token event omits it', () => {
+  const state = { sessionId: 'codex-s1', model: 'gpt-test' }
+  parseCodexLine(JSON.stringify({
+    type: 'event_msg', timestamp: '2026-08-27T00:01:00Z',
+    payload: { type: 'token_count', info: { model_context_window: 258400, last_token_usage: {
+      input_tokens: 100, cached_input_tokens: 80, output_tokens: 10,
+    } } },
+  }), state)
+  const rec = parseCodexLine(JSON.stringify({
+    type: 'event_msg', timestamp: '2026-08-27T00:02:00Z',
+    payload: { type: 'token_count', info: { last_token_usage: {
+      input_tokens: 120, cached_input_tokens: 80, output_tokens: 10,
+    } } },
+  }), state)
+  assert.strictEqual(rec.contextWindow, 258400)
+})
+
 test('Pi assistant usage becomes an exact cost record without message content', () => {
   const state = {}
   parsePiLine(JSON.stringify({ type: 'session', id: 'pi-s1', timestamp: '2026-08-27T00:00:00Z', cwd: '/tmp/project' }), state)
@@ -641,6 +658,22 @@ test('Codex/Pi records keep separate sessions and exact gauge windows', () => {
   assert.strictEqual(pi.session.cumulative_cost_micros, 12345)
   assert.ok(pi.activeSessions.some((row) => row.id === 'codex-s1'))
   assert.ok(pi.activeSessions.some((row) => row.id === 'pi-s1'))
+  s.close()
+})
+
+test('a duplicate CLI replay can backfill a missing context window', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const rec = {
+    requestId: 'codex:backfill', sessionId: 'codex-backfill', source: 'codex',
+    ts: new Date().toISOString(), provider: 'openai', model: 'gpt-test',
+    inputTokens: 100, cacheReadTokens: 900, outputTokens: 20,
+    contextTokens: 1000, contextWindow: null,
+  }
+  assert.strictEqual(s.ingestCliRequest(rec).action, 'cli')
+  assert.strictEqual(s.getSession('codex-backfill').windowKnown, false)
+  assert.strictEqual(s.ingestCliRequest({ ...rec, contextWindow: 258400 }).action, 'duplicate')
+  assert.strictEqual(s.getSession('codex-backfill').contextWindow, 258400)
   s.close()
 })
 

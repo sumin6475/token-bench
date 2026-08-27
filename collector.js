@@ -79,6 +79,9 @@ Filtering affects PRINTING only. The schema summary on Ctrl-C, --jsonl,
 }
 
 const opts = parseArgs(process.argv.slice(2))
+// Increment when the desktop shell must reject an older sidecar. This keeps a
+// stale orphaned collector from serving old widget/API code after an app update.
+const WIDGET_PROTOCOL_VERSION = 2
 
 // ---------------------------------------------------------------------------
 // Terminal colors (skipped when piped, or when NO_COLOR is set)
@@ -308,13 +311,22 @@ function serveState(res, requestUrl = '/state') {
     }))
   }
   try {
-    const selectedSession = new URL(requestUrl, 'http://x').searchParams.get('session')
+    const params = new URL(requestUrl, 'http://x').searchParams
+    const selectedSession = params.get('session')
+    // A manual/automatic widget retry replays only the bounded recent log
+    // slices. Request rows are idempotent; the session upsert can still repair
+    // metadata that was missing during the first pass (notably Codex's exact
+    // model_context_window).
+    const refresh = params.get('refresh') === '1' && cliScanner
+      ? cliScanner.refreshLogs()
+      : null
     const runtime = cliScanner ? cliScanner.snapshot() : { runningClis: [], processDetection: 'unavailable' }
     const runningSources = runtime.runningClis.map((p) => p.source)
     res.end(JSON.stringify({
       store: true,
       ...store.getWidgetState(selectedSession, runningSources),
       runtime,
+      refresh,
       collector,
       tracking: store.getTrackingStatus(collector),
     }))
@@ -327,6 +339,7 @@ function serveHealthz(res) {
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({
     status: 'ok',
+    widgetProtocol: WIDGET_PROTOCOL_VERSION,
     uptimeMs: Date.now() - health.startedAt.getTime(),
     pid: process.pid,
   }))

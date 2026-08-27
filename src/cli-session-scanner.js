@@ -57,11 +57,21 @@ function parseCodexLine(line, state) {
     return null
   }
   if (row.type === 'turn_context') {
-    state.model = p.model || state.model
+    const nextModel = p.model || state.model
+    if (state.model && nextModel && nextModel !== state.model) state.contextWindow = null
+    state.model = nextModel
     state.project = p.cwd || state.project
+    const turnWindow = Number(p.model_context_window || p.context_window || 0)
+    if (turnWindow > 0) state.contextWindow = turnWindow
     return null
   }
   if (row.type !== 'event_msg' || p.type !== 'token_count' || !p.info) return null
+
+  // Codex normally repeats this on every token_count event, but retaining the
+  // last exact value prevents a transient "unknown window" when a partial
+  // event omits it. This is observed metadata, never a model-name guess.
+  const reportedWindow = Number(p.info.model_context_window || p.info.context_window || 0)
+  if (reportedWindow > 0) state.contextWindow = reportedWindow
 
   const u = p.info.last_token_usage
   if (!u || !state.sessionId) return null
@@ -83,7 +93,7 @@ function parseCodexLine(line, state) {
     cacheCreationTokens: cacheWrite,
     outputTokens: Number(u.output_tokens || 0),
     contextTokens: totalInput + cacheWrite,
-    contextWindow: Number(p.info.model_context_window || 0) || null,
+    contextWindow: state.contextWindow || null,
     costMicros: 0,
     costSource: 'subscription',
   }
@@ -191,6 +201,23 @@ class CliSessionScanner {
       runningClis: this.running,
       processDetection: this.lastProcessError ? 'unavailable' : 'available',
       processDetectionReason: this.lastProcessError,
+    }
+  }
+
+  /**
+   * Re-read recent usage logs from their bounded head/tail windows. This is
+   * intentionally user/endpoint-triggered: duplicate request rows stay
+   * idempotent, while session metadata such as context_window is backfilled by
+   * the upsert that runs before duplicate detection.
+   */
+  refreshLogs() {
+    this.files.clear()
+    try {
+      this.#scanLogs()
+      return { ok: true }
+    } catch (e) {
+      console.error(`  ! CLI log refresh: ${e.message}`)
+      return { ok: false, error: e.message }
     }
   }
 

@@ -115,6 +115,8 @@
 
   .gauge-wrap { position: relative; margin: 2px 0 0; }
   svg.gauge { display: block; width: 100%; height: auto; }
+  .gauge-wrap.loading svg.gauge { opacity: .32; animation: gauge-pulse 1.5s ease-in-out infinite; }
+  @keyframes gauge-pulse { 0%, 100% { opacity: .22; } 50% { opacity: .42; } }
   .gauge-center {
     /* Sits in the open middle of the semicircle, clear of the hub and the
        resting (horizontal) needle — a dial reads value-in-the-dial. */
@@ -124,6 +126,19 @@
   .pct { font-size: 34px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
   .pct .unit { font-size: 16px; color: var(--muted); font-weight: 600; }
   .pct.unknown { color: var(--unknown); }
+  .gauge-status {
+    position: absolute; inset: 30px 0 12px;
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; text-align: center; color: var(--muted); font-size: 11px;
+  }
+  .gauge-wrap.loading .gauge-status { display: flex; }
+  .gauge-wrap.loading .gauge-center { display: none; }
+  .retry-btn {
+    appearance: none; background: #10131a; color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px;
+    padding: 5px 10px; font: 600 11px var(--sans); cursor: pointer;
+  }
+  .retry-btn:hover { color: var(--teal); border-color: var(--teal); }
 
   .counts { text-align: center; margin-top: 2px; }
   .counts .level { font-family: var(--mono); font-size: 14px; }
@@ -158,6 +173,7 @@
   .today .det .warn { color: var(--amber); }
 
   .empty { text-align: center; color: var(--muted); font-size: 12px; padding: 26px 8px; line-height: 1.5; }
+  .empty .retry-btn { display: block; margin: 10px auto 0; }
   .stale { color: var(--amber); }
   .foot { text-align: center; font-size: 9px; color: #4b5563; margin-top: 6px; letter-spacing: .03em; }
 </style>
@@ -183,7 +199,10 @@
   <div class="cli-strip" id="cli-strip"></div>
 
   <div id="body">
-    <div class="empty" id="empty">connecting…</div>
+    <div class="empty" id="empty">
+      <span id="empty-message">Connecting…</span>
+      <button class="retry-btn" id="empty-retry" type="button">Reload</button>
+    </div>
 
     <div id="live" style="display:none">
       <div class="meta" data-tauri-drag-region>
@@ -192,7 +211,7 @@
         <span class="pipe" id="pipe" title="telemetry pipe status"></span>
       </div>
 
-      <div class="gauge-wrap">
+      <div class="gauge-wrap" id="gauge-wrap">
         <svg class="gauge" viewBox="0 0 220 128" id="svg">
           <path id="band-teal"  fill="none" stroke-width="14" stroke-linecap="butt" />
           <path id="band-amber" fill="none" stroke-width="14" stroke-linecap="butt" />
@@ -202,6 +221,10 @@
         </svg>
         <div class="gauge-center">
           <div class="pct" id="pct">—</div>
+        </div>
+        <div class="gauge-status" id="gauge-status">
+          <span id="gauge-status-text">Loading context limit…</span>
+          <button class="retry-btn" id="gauge-retry" type="button">Reload</button>
         </div>
       </div>
 
@@ -325,9 +348,9 @@ const projectName = (project) => project ? project.split('/').filter(Boolean).po
 function render(state) {
   current = state
 
-  if (!state || state.store === false) {
+  if (!state || state.store === false || state.error) {
     live.style.display = 'none'; empty.style.display = '';
-    empty.innerHTML = (state && state.message) || 'collector has no store'
+    el('empty-message').textContent = (state && (state.message || state.error)) || 'Collector is getting ready…'
     return
   }
   empty.style.display = 'none'; live.style.display = '';
@@ -374,11 +397,12 @@ function render(state) {
   // model's window unknown (P0-8: never render a guessed percentage).
   const tokens = s ? s.latest_context_tokens : null
   if (s && tokens != null && !s.windowKnown) {
+    setGaugeLoading('Loading context limit…')
     drawGrayBand(); setNeedle(0, false)
-    el('pct').className = 'pct unknown'; el('pct').innerHTML = '?<span class="unit"> window</span>'
-    el('level').innerHTML = n(tokens) + ' <span style="color:var(--muted)">/ ?</span>'
+    el('level').textContent = n(tokens) + ' tokens tracked'
     renderSplit(state.split)
   } else {
+    setGaugeLoading(!s ? 'Waiting for a CLI session…' : tokens == null ? 'Waiting for token usage…' : null)
     const frac = (s && tokens != null && s.windowKnown) ? s.gaugePercent : 0
     drawColoredBands(); setNeedle(frac, true)
     el('pct').className = 'pct'
@@ -388,7 +412,7 @@ function render(state) {
       renderSplit(state.split)
     } else {
       el('level').textContent = s && s.contextWindow ? '0 / ' + n(s.contextWindow) : '0 tokens'
-      splitText(s ? 'no main-thread request yet' : 'run Claude Code or Jan to start measuring')
+      splitText(s ? 'no main-thread request yet' : 'run Claude Code, Codex, or Pi to start measuring')
     }
   }
 
@@ -435,27 +459,50 @@ function renderSplit(split) {
 
 function splitText(t) { el('split').textContent = t }
 
+function setGaugeLoading(message) {
+  const wrap = el('gauge-wrap')
+  wrap.classList.toggle('loading', !!message)
+  if (message) el('gauge-status-text').textContent = message
+}
+
 // Preview hook: ?shell=1 forces the app layout in a plain browser (screenshots).
 if (location.search.includes('shell=1')) document.body.classList.add('tauri-shell')
 
 // --- polling ----------------------------------------------------------------
-async function poll() {
+const refreshedSessions = new Set()
+
+async function poll({ refresh = false } = {}) {
   try {
-    const query = selectedSessionId ? `?session=${encodeURIComponent(selectedSessionId)}` : ''
+    const params = new URLSearchParams()
+    if (selectedSessionId) params.set('session', selectedSessionId)
+    if (refresh) params.set('refresh', '1')
+    const queryString = params.toString()
+    const query = queryString ? `?${queryString}` : ''
     const r = await fetch('/state' + query, { cache: 'no-store' })
+    if (!r.ok) throw new Error(`collector returned ${r.status}`)
     const state = await r.json()
     if (state.selectedSessionId && state.selectedSessionId !== selectedSessionId) {
       selectedSessionId = state.selectedSessionId
       localStorage.setItem('tokenbench.selectedSession', selectedSessionId)
     }
     render(state)
+    const s = state.session
+    if (s && s.latest_context_tokens != null && !s.windowKnown && !refreshedSessions.has(s.id)) {
+      refreshedSessions.add(s.id)
+      setTimeout(() => poll({ refresh: true }), 150)
+    } else if (s && s.windowKnown) {
+      refreshedSessions.delete(s.id)
+    }
   } catch (e) {
     live.style.display = 'none'; empty.style.display = '';
-    empty.innerHTML = '<span class="stale">collector not reachable</span>'
+    el('empty-message').textContent = 'Collector is reconnecting…'
   }
 }
 poll()
 setInterval(poll, 1000)
+
+el('empty-retry').addEventListener('click', () => poll({ refresh: true }))
+el('gauge-retry').addEventListener('click', () => poll({ refresh: true }))
 
 // --- session selection ------------------------------------------------------
 function sessionOptionLabel(s) {

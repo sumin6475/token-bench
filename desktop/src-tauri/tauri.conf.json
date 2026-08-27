@@ -12,7 +12,7 @@
       {
         "label": "main",
         "title": "TokenBench",
-        "url": "http://localhost:4318/widget",
+        "url": "index.html",
         "width": 344,
         "height": 470,
         "resizable": false,

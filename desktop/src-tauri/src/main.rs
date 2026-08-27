@@ -25,10 +25,13 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
+const COLLECTOR_PROTOCOL_MARKER: &str = "\"widgetProtocol\":2";
+
 /// Holds the collector child process so it can be killed on exit.
 struct Sidecar {
     child: Mutex<Option<Child>>,
     stopping: AtomicBool,
+    widget_loaded: AtomicBool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,7 +110,7 @@ fn open_dashboard(app: &AppHandle) {
         let _ = w.set_focus();
         return;
     }
-    let url: tauri::Url = "http://localhost:4318/dashboard".parse().unwrap();
+    let url: tauri::Url = "http://127.0.0.1:4318/dashboard".parse().unwrap();
     if let Err(e) = WebviewWindowBuilder::new(app, "dashboard", WebviewUrl::External(url))
         .title("TokenBench Dashboard")
         .inner_size(1080.0, 780.0)
@@ -118,30 +121,123 @@ fn open_dashboard(app: &AppHandle) {
     }
 }
 
-fn collector_is_healthy() -> bool {
+fn collector_health_response() -> Option<String> {
     let address = SocketAddr::from(([127, 0, 0, 1], 4318));
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(350)) else {
-        return false;
+        return None;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(350)));
     if stream
         .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .is_err()
     {
-        return false;
+        return None;
     }
     let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok()
+    if stream.read_to_string(&mut response).is_ok()
         && response.starts_with("HTTP/1.1 200")
         && response.contains("\"status\":\"ok\"")
+    {
+        Some(response)
+    } else {
+        None
+    }
+}
+
+fn collector_is_healthy() -> bool {
+    collector_health_response()
+        .is_some_and(|response| response.contains(COLLECTOR_PROTOCOL_MARKER))
+}
+
+/// Stop only a bundled TokenBench collector, never an unrelated service or a
+/// collector the user launched manually. This repairs the macOS crash/orphan
+/// case where an older app leaves :4318 alive across an update.
+fn stop_stale_bundled_collector() -> bool {
+    let Ok(listeners) = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-tiTCP:4318", "-sTCP:LISTEN"])
+        .output()
+    else {
+        return false;
+    };
+    if !listeners.status.success() {
+        return false;
+    }
+
+    let mut stopped = false;
+    for pid in String::from_utf8_lossy(&listeners.stdout).lines() {
+        if !pid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(details) = Command::new("/bin/ps")
+            .args(["-p", pid, "-o", "command="])
+            .output()
+        else {
+            continue;
+        };
+        let command = String::from_utf8_lossy(&details.stdout);
+        let is_bundled_sidecar = command.contains("/TokenBench.app/Contents/MacOS/node")
+            && command.contains("/TokenBench.app/Contents/Resources/sidecar/collector.js");
+        if is_bundled_sidecar
+            && Command::new("/bin/kill")
+                .arg(pid)
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            println!("tokenbench: stopped stale bundled collector pid={pid}");
+            stopped = true;
+        }
+    }
+    if stopped {
+        for _ in 0..20 {
+            if collector_health_response().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    stopped
 }
 
 fn check_collector_health() -> String {
-    if collector_is_healthy() {
-        "healthy".into()
-    } else {
-        "unreachable".into()
+    match collector_health_response() {
+        Some(response) if response.contains(COLLECTOR_PROTOCOL_MARKER) => "healthy".into(),
+        Some(_) => "outdated".into(),
+        None => "unreachable".into(),
     }
+}
+
+/// The configured webview is created before setup runs, so a cold start can
+/// otherwise navigate to :4318 a few milliseconds before Node begins listening
+/// and remain on WebKit's blank error page. Keep it hidden, then navigate and
+/// reveal it exactly once after the compatible collector is ready.
+fn reveal_widget_once(app: &AppHandle) {
+    let sidecar = app.state::<Sidecar>();
+    if sidecar.widget_loaded.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(widget) = app.get_webview_window("main") else {
+        sidecar.widget_loaded.store(false, Ordering::Relaxed);
+        return;
+    };
+    let url: tauri::Url = "http://127.0.0.1:4318/widget".parse().unwrap();
+    if let Err(e) = widget.navigate(url) {
+        eprintln!("tokenbench: could not load widget after collector startup: {e}");
+        sidecar.widget_loaded.store(false, Ordering::Relaxed);
+        return;
+    }
+    let _ = widget.show();
+    let _ = widget.set_focus();
+}
+
+fn reveal_widget_when_ready(app: &AppHandle) {
+    for _ in 0..80 {
+        if collector_is_healthy() {
+            reveal_widget_once(app);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("tokenbench: collector startup timed out; widget remains hidden until watchdog recovery");
 }
 
 fn spawn_collector(node: &PathBuf, collector: &PathBuf, db: &PathBuf) -> std::io::Result<Child> {
@@ -159,14 +255,27 @@ fn open_dashboard_cmd(app: AppHandle) {
     open_dashboard(&app);
 }
 
+#[tauri::command]
+fn load_widget_cmd(app: AppHandle) -> bool {
+    if !collector_is_healthy() {
+        return false;
+    }
+    let Some(widget) = app.get_webview_window("main") else {
+        return false;
+    };
+    let url: tauri::Url = "http://127.0.0.1:4318/widget".parse().unwrap();
+    widget.navigate(url).is_ok()
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Sidecar {
             child: Mutex::new(None),
             stopping: AtomicBool::new(false),
+            widget_loaded: AtomicBool::new(false),
         })
-        .invoke_handler(tauri::generate_handler![open_dashboard_cmd])
+        .invoke_handler(tauri::generate_handler![open_dashboard_cmd, load_widget_cmd])
         .setup(|app| {
             let preferences = load_preferences(app.handle());
             if let Some(widget) = app.get_webview_window("main") {
@@ -234,6 +343,9 @@ fn main() {
             if collector_is_healthy() {
                 println!("tokenbench: attached to the collector already running on :4318");
             } else {
+                if collector_health_response().is_some() {
+                    stop_stale_bundled_collector();
+                }
                 match spawn_collector(&node, &collector, &db) {
                 Ok(child) => {
                     println!(
@@ -253,6 +365,8 @@ fn main() {
                 }
             }
 
+            reveal_widget_when_ready(app.handle());
+
             // A crashed sidecar must not leave the widget permanently dead.
             // The watchdog also takes ownership if an external collector that
             // was already on :4318 later disappears.
@@ -262,6 +376,10 @@ fn main() {
                 let sidecar = watchdog_app.state::<Sidecar>();
                 if sidecar.stopping.load(Ordering::Relaxed) {
                     break;
+                }
+
+                if collector_is_healthy() {
+                    reveal_widget_once(&watchdog_app);
                 }
 
                 let needs_child = {
@@ -276,6 +394,11 @@ fn main() {
                     }
                 };
                 if needs_child && !collector_is_healthy() {
+                    if collector_health_response().is_some() && !stop_stale_bundled_collector() {
+                        // An incompatible listener that is not our bundled
+                        // sidecar must not be killed or competed with.
+                        continue;
+                    }
                     match spawn_collector(&node, &collector, &db) {
                         Ok(mut child) => {
                             if sidecar.stopping.load(Ordering::Relaxed) {
@@ -294,8 +417,10 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building the TokenBench application")
         .run(|app_handle, event| {
-            // P0-10: on quit, kill the sidecar so :4318/:8787 are released.
-            if let RunEvent::ExitRequested { .. } = event {
+            // P0-10: macOS can reach either ExitRequested or Exit depending on
+            // how the app is closed. Handle both; taking the Option makes this
+            // idempotent if both events arrive.
+            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
                 let sidecar = app_handle.state::<Sidecar>();
                 sidecar.stopping.store(true, Ordering::Relaxed);
                 let owned_child = sidecar.child.lock().unwrap().take();
