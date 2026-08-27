@@ -658,6 +658,10 @@ test('Codex/Pi records keep separate sessions and exact gauge windows', () => {
   assert.strictEqual(pi.session.cumulative_cost_micros, 12345)
   assert.ok(pi.activeSessions.some((row) => row.id === 'codex-s1'))
   assert.ok(pi.activeSessions.some((row) => row.id === 'pi-s1'))
+
+  const dashboardCodex = s.getDashboardData(1).bySession.find((row) => row.id === 'codex-s1')
+  assert.strictEqual(dashboardCodex.contextWindow, 100000)
+  assert.strictEqual(dashboardCodex.gaugePercent, 0.51)
   s.close()
 })
 

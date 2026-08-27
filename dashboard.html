@@ -124,6 +124,9 @@
   .sess .smeta { font-size: 10px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sess .sfill { height: 10px; border-radius: 4px; background: var(--page); overflow: hidden; }
   .sess .sfill > i { display: block; height: 100%; border-radius: 4px; min-width: 0; }
+  .sess .sanatomy { display: flex; height: 4px; margin-top: 4px; border-radius: 3px;
+    overflow: hidden; background: var(--page); gap: 1px; }
+  .sess .sanatomy > i { display: block; height: 100%; min-width: 1px; }
   .sess .slbl { font-size: 10px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
   .sess .sval { font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; text-align: right; }
   .sess .sval .n { color: var(--muted); font-size: 11px; }
@@ -178,8 +181,16 @@
 <div class="grid">
   <!-- Sessions: operational index. Click a row to scope every chart below. -->
   <div class="card">
-    <h2>Sessions</h2>
-    <div class="hint">each conversation's context fill — a level, not a running sum. click a row to inspect it</div>
+    <div class="card-head">
+      <div><h2>Sessions</h2>
+        <div class="hint">context fill plus each session's token mix · click a row to inspect it</div></div>
+      <div class="legend" aria-label="Session token types">
+        <span class="key"><i class="sw" style="background:#c86a28"></i>fresh</span>
+        <span class="key"><i class="sw" style="background:#2aa7a0"></i>cache read</span>
+        <span class="key"><i class="sw" style="background:#b06fd6"></i>cache write</span>
+        <span class="key"><i class="sw" style="background:#d55181"></i>output</span>
+      </div>
+    </div>
     <div id="sessions"></div>
     <details><summary>View as table</summary><div id="sessiontable"></div></details>
   </div>
@@ -292,19 +303,35 @@ let days = 7
 let sessionId = null
 let data = null
 let firstLoad = true
+let loading = false
+let retryTimer = null
 
 async function load() {
+  if (loading) return
+  loading = true
   const plots = document.querySelectorAll('.plot, #models, #ctxfit, #anatomy, #agentic, #tasktable, #sessions')
   if (!firstLoad) plots.forEach(p => p.classList.add('loading'))
   try {
     const q = '/dashboard-data?days=' + days + (sessionId ? '&session=' + encodeURIComponent(sessionId) : '')
     const r = await fetch(q, { cache: 'no-store' })
-    data = await r.json()
+    if (!r.ok) throw new Error(`collector returned ${r.status}`)
+    const next = await r.json()
+    if (!next || next.store === false || next.error || !next.totals || !Array.isArray(next.bySession)) {
+      throw new Error((next && (next.error || next.message)) || 'dashboard data is not ready')
+    }
+    data = next
     render()
+    clearTimeout(retryTimer)
     el('live').textContent = 'updated ' + new Date().toLocaleTimeString()
-  } catch { el('live').textContent = 'collector not reachable' }
+  } catch (error) {
+    console.warn('TokenBench dashboard retry:', error)
+    el('live').textContent = 'loading dashboard…'
+    clearTimeout(retryTimer)
+    retryTimer = setTimeout(load, 750)
+  }
   plots.forEach(p => p.classList.remove('loading'))
   firstLoad = false
+  loading = false
 }
 
 // --- filters (scope everything below) ---------------------------------------
@@ -398,8 +425,9 @@ function shortId(id) {
   return id.slice(0, 8)
 }
 function sessSource(s) {
-  if (s.source === 'claude-code') return 'claude-code'
-  return s.provider || s.source
+  const labels = { 'claude-code': 'Claude Code', codex: 'Codex', pi: 'Pi' }
+  if (labels[s.source]) return labels[s.source]
+  return s.source === 'proxy' ? `Proxy · ${s.provider || 'unknown'}` : (s.source || s.provider || 'unknown')
 }
 function relTime(iso) {
   const sec = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
@@ -456,6 +484,20 @@ function renderSessions() {
     fill.appendChild(bar)
 
     const inTot = s.fresh_input + s.cache_read + s.cache_creation
+    const anatomyTotal = inTot + s.output
+    const anatomy = document.createElement('div'); anatomy.className = 'sanatomy'
+    anatomy.setAttribute('aria-label', 'Token mix for this session')
+    if (anatomyTotal > 0) {
+      for (const part of ANATOMY) {
+        const value = Number(s[part.key] || 0)
+        if (value <= 0) continue
+        const segment = document.createElement('i')
+        segment.style.width = (value / anatomyTotal * 100) + '%'
+        segment.style.background = part.color
+        segment.title = `${part.name}: ${nf.format(value)} tokens`
+        anatomy.appendChild(segment)
+      }
+    }
     const slbl = document.createElement('div'); slbl.className = 'slbl'
     if (s.latest_context_tokens == null) {
       slbl.textContent = 'no main-thread request yet'
@@ -467,7 +509,7 @@ function renderSessions() {
         ' · ' + Math.round(frac * 100) + '%' +
         (s.peak_context && s.peak_context !== s.latest_context_tokens ? ' · peak ' + tok(s.peak_context) : '')
     }
-    mid.append(fill, slbl)
+    mid.append(fill, anatomy, slbl)
 
     const right = document.createElement('div'); right.className = 'sval'
     if (s.provider === 'local') {

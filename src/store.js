@@ -948,7 +948,7 @@ class Store {
     // Session list is the date-range census, never narrowed by the picker —
     // otherwise you couldn't switch away from the session you just clicked.
     const bySession = this.db
-      .prepare(`SELECT s.id, s.source, s.model, s.task_type,
+      .prepare(`SELECT s.id, s.source, s.model, s.task_type, s.context_window,
                        s.started_at, s.last_seen_at,
                        s.latest_context_tokens, s.compaction_count,
                        MAX(r.provider) AS provider,
@@ -965,7 +965,10 @@ class Store {
                  ORDER BY s.last_seen_at DESC`)
       .all(from)
       .map((row) => {
-        const win = resolveContextWindow(row.model, this.windows)
+        // Native CLIs can report the exact per-session window even when the
+        // model id is newer than our static table. Use that observed value
+        // first, matching the widget's session decoration logic.
+        const win = int(row.context_window, null) || resolveContextWindow(row.model, this.windows)
         return {
           ...row,
           contextWindow: win,
