@@ -26,7 +26,7 @@ function parseArgs(argv) {
     port: 8787, host: '127.0.0.1',
     upstream: 'https://api.openai.com',
     localUpstream: 'http://127.0.0.1:1337',
-    db: null, quiet: false,
+    db: null, quiet: false, allowPrivateUpstream: false,
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -36,6 +36,7 @@ function parseArgs(argv) {
     else if (a === '--local-upstream') opts.localUpstream = argv[++i]
     else if (a === '--db') opts.db = argv[++i]
     else if (a === '--quiet') opts.quiet = true
+    else if (a === '--allow-private-upstream') opts.allowPrivateUpstream = true
     else if (a === '--help' || a === '-h') {
       console.log(`TokenBench Phase 4 proxy (standalone)
 
@@ -44,6 +45,8 @@ function parseArgs(argv) {
   --host <addr>          bind address (default 127.0.0.1, loopback only)
   --upstream <url>       upstream for bare /v1 paths (default https://api.openai.com)
   --local-upstream <url> upstream for /local/* (default http://127.0.0.1:1337 — Jan's server)
+  --allow-private-upstream  allow x-tb-upstream to target private/loopback hosts
+                           (SSRF guard is ON by default: header upstreams are public-only)
   --quiet                suppress the per-request line
 
 Path routing:   /openai/v1/*  /anthropic/v1/*  /local/v1/*  or bare /v1/* -> --upstream
@@ -77,6 +80,7 @@ const server = createProxyServer({
   defaultUpstream: opts.upstream,
   localUpstream: opts.localUpstream,
   quiet: opts.quiet,
+  allowPrivateUpstream: opts.allowPrivateUpstream,
 })
 
 server.on('error', (e) => {
@@ -90,6 +94,10 @@ server.on('error', (e) => {
 })
 
 server.listen(opts.port, opts.host, () => {
+  if (!['127.0.0.1', 'localhost', '::1'].includes(opts.host)) {
+    console.warn(red(`  ! bound to ${opts.host} — the proxy serves ANY interface. Anyone who can reach it`))
+    console.warn(red('    can relay requests through it (SSRF guard only protects the x-tb-upstream header).'))
+  }
   console.log('')
   console.log(bold('  TokenBench') + dim(' — Phase 4 proxy'))
   console.log(dim(`  listening on http://${opts.host}:${opts.port}`))

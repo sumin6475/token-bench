@@ -1,11 +1,18 @@
 # TokenBench — Phase 1 telemetry env vars.
-# Source this in the shell you launch Claude Code from:
+#
+# Preferred: don't source this at all. Launch claude through the launcher,
+# which exports these itself AND starts the collector if needed:
+#
+#   ./tb-claude          # or: bin/tokenbench claude
+#
+# This file remains for manual setups. Source it in the shell you launch
+# Claude Code from:
 #
 #   source env.sh && claude
 #
 # These are per-shell. A Claude Code session started from a shell that did not
-# source this file emits nothing — that is the single most common reason the
-# collector stays silent.
+# source this file emits nothing — the launcher exists specifically to remove
+# that failure mode. Diagnose with:  node collector.js --check
 
 # --- from the PRD, section 4.1 ---
 export CLAUDE_CODE_ENABLE_TELEMETRY=1

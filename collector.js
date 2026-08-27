@@ -27,13 +27,16 @@ const path = require('node:path')
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const opts = { port: 4318, host: '127.0.0.1', raw: false, jsonl: null, quiet: false, only: null, db: null, proxy: null, localUpstream: 'http://127.0.0.1:1337', upstream: 'https://api.openai.com' }
+  const opts = { port: 4318, host: '127.0.0.1', raw: false, jsonl: null, quiet: false, only: null, db: null, proxy: null, localUpstream: 'http://127.0.0.1:1337', upstream: 'https://api.openai.com', check: false, allowPrivateUpstream: false, staleAfter: 15 }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--port') opts.port = Number(argv[++i])
     else if (a === '--host') opts.host = argv[++i]
     else if (a === '--raw') opts.raw = true
     else if (a === '--quiet') opts.quiet = true
+    else if (a === '--check') opts.check = true
+    else if (a === '--allow-private-upstream') opts.allowPrivateUpstream = true
+    else if (a === '--stale-after') opts.staleAfter = Number(argv[++i])
     else if (a === '--jsonl') opts.jsonl = argv[++i]
     else if (a === '--db') opts.db = argv[++i]
     else if (a === '--proxy') {
@@ -56,12 +59,15 @@ function parseArgs(argv) {
                     sharing the same store — the mode the Mac app uses
   --local-upstream <url>  proxy /local/* target (default http://127.0.0.1:1337, Jan's server)
   --upstream <url>  proxy default for bare /v1 paths (default https://api.openai.com)
+  --allow-private-upstream  permit x-tb-upstream proxy targets on private/loopback hosts
   --only a,b        only print events whose name contains one of these substrings
   --tokens          shorthand for the token/cost-relevant events only
+  --stale-after <n> console-warn after n min without telemetry (default 15)
+  --check           diagnose the pipe (port, env vars, probe POST) and exit
   --quiet           suppress the per-event block, keep only the running counters
 
-Filtering affects PRINTING only. The schema summary on Ctrl-C, and --jsonl,
-always cover every event received.
+Filtering affects PRINTING only. The schema summary on Ctrl-C, --jsonl,
+/state and /healthz .. /tracking-status always cover every event received.
 `)
       process.exit(0)
     } else {
@@ -88,6 +94,47 @@ const yellow = c('33')
 const blue = c('34')
 const magenta = c('35')
 const cyan = c('36')
+
+// ---------------------------------------------------------------------------
+// Health state (Phase 1) — answers "is the pipe actually working?" instead of
+// letting a silent $0.00 on the dashboard pass for 'nothing happened'. Every
+// event-level value here is wired-level truth: what actually ARRIVED at the
+// collector, before ingest decides what to persist.
+// ---------------------------------------------------------------------------
+
+const health = {
+  startedAt: new Date(),
+  lastRequestAt: null, // any HTTP request handled
+  lastEventAt: null, // last telemetry EVENT timestamp (data semantics)
+  lastEventArrivedAt: null, // when that event was RECEIVED (liveness semantics)
+  lastApiRequestAt: null, // any api_request event seen
+  otlpRequestCount: 0,
+  eventCount: 0,
+  apiRequestCount: 0,
+  malformedRequestCount: 0,
+  kinds: {}, // '/v1/logs' -> count
+  lastWarnedAt: 0,
+}
+
+function healthSnapshot() {
+  return {
+    startedAt: health.startedAt.toISOString(),
+    lastRequestAt: health.lastRequestAt,
+    lastEventAt: health.lastEventAt,
+    lastEventArrivedAt: health.lastEventArrivedAt,
+    lastApiRequestAt: health.lastApiRequestAt,
+    otlpRequestCount: health.otlpRequestCount,
+    eventCount: health.eventCount,
+    apiRequestCount: health.apiRequestCount,
+    malformedRequestCount: health.malformedRequestCount,
+    kinds: { ...health.kinds },
+  }
+}
+
+// --check: diagnose the pipe without starting the server, then exit.
+if (opts.check) {
+  runCheck(opts).then((code) => process.exit(code)).catch((e) => { console.error(red(`  ! check failed: ${e.stack || e}`)); process.exit(1) })
+}
 
 // ---------------------------------------------------------------------------
 // OTLP/JSON decoding helpers
@@ -139,6 +186,9 @@ function hhmmss(d) {
 // ---------------------------------------------------------------------------
 
 const seen = new Map() // eventName -> { count, keys: Set }
+// First-sighting alarm: names that arrived but that ingest will DROP are worth
+// one loud line — a Claude Code update changing the wire must not melt silently.
+const seenEventNames = new Set()
 
 function record(kind, name, attrs) {
   const id = `${kind}:${name}`
@@ -174,9 +224,13 @@ function tee(obj) {
 // ---------------------------------------------------------------------------
 
 let store = null
+let cliScanner = null
 if (opts.db) {
   const { Store } = require('./src/store.js')
   store = new Store(path.resolve(opts.db))
+  const { CliSessionScanner } = require('./src/cli-session-scanner.js')
+  cliScanner = new CliSessionScanner({ store })
+  cliScanner.start()
   console.log(dim(`  storing to ${path.resolve(opts.db)}`))
 }
 
@@ -189,7 +243,9 @@ if (opts.db) {
 // ---------------------------------------------------------------------------
 
 let proxyServer = null
-if (opts.proxy) {
+// In --check mode we must not bind ANYTHING: runCheck probes the port by
+// connecting to it, and binding our own listener would answer ourselves.
+if (!opts.check && opts.proxy) {
   const { createProxyServer } = require('./src/proxy-core.js')
   if (!store) console.log(yellow('  ! --proxy without --db: forwarding works but usage will NOT be stored'))
   proxyServer = createProxyServer({
@@ -197,6 +253,7 @@ if (opts.proxy) {
     defaultUpstream: opts.upstream,
     localUpstream: opts.localUpstream,
     quiet: opts.quiet,
+    allowPrivateUpstream: opts.allowPrivateUpstream,
   })
   proxyServer.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
@@ -238,16 +295,73 @@ function persist(rec) {
 const WIDGET_PATH = path.join(__dirname, 'widget.html')
 const DASH_PATH = path.join(__dirname, 'dashboard.html')
 
-function serveState(res) {
+function serveState(res, requestUrl = '/state') {
   res.writeHead(200, { 'content-type': 'application/json' })
+  const collector = healthSnapshot()
+  const { deriveTrackingStatus } = require('./src/store.js')
   if (!store) {
     return res.end(JSON.stringify({
       store: false,
+      collector,
+      tracking: deriveTrackingStatus({ now: new Date(), ...collector }),
       message: 'collector is running without --db. Restart with --db <file> to see live numbers.',
     }))
   }
   try {
-    res.end(JSON.stringify({ store: true, ...store.getWidgetState() }))
+    const selectedSession = new URL(requestUrl, 'http://x').searchParams.get('session')
+    const runtime = cliScanner ? cliScanner.snapshot() : { runningClis: [], processDetection: 'unavailable' }
+    const runningSources = runtime.runningClis.map((p) => p.source)
+    res.end(JSON.stringify({
+      store: true,
+      ...store.getWidgetState(selectedSession, runningSources),
+      runtime,
+      collector,
+      tracking: store.getTrackingStatus(collector),
+    }))
+  } catch (e) {
+    res.end(JSON.stringify({ store: true, error: e.message }))
+  }
+}
+
+function serveHealthz(res) {
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({
+    status: 'ok',
+    uptimeMs: Date.now() - health.startedAt.getTime(),
+    pid: process.pid,
+  }))
+}
+
+function serveReadyz(res) {
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ status: 'ready' }))
+}
+
+function serveTrackingStatus(res) {
+  res.writeHead(200, { 'content-type': 'application/json' })
+  const collector = healthSnapshot()
+  try {
+    const { deriveTrackingStatus } = require('./src/store.js')
+    const body = store
+      ? store.getTrackingStatus(collector)
+      : { ...deriveTrackingStatus({ now: new Date(), ...collector }), store: false }
+    res.end(JSON.stringify(body))
+  } catch (e) {
+    res.end(JSON.stringify({ error: e.message }))
+  }
+}
+
+function serveEventCoverage(res) {
+  res.writeHead(200, { 'content-type': 'application/json' })
+  if (!store) return res.end(JSON.stringify({ store: false }))
+  try {
+    const rows = store.getEventCoverage()
+    res.end(JSON.stringify({
+      store: true,
+      total: rows.length,
+      persisted: rows.filter((r) => r.persisted).length,
+      events: rows,
+    }))
   } catch (e) {
     res.end(JSON.stringify({ store: true, error: e.message }))
   }
@@ -346,7 +460,26 @@ function printEvent({ kind, name, time, attrs, resource, scope, body }) {
   record(kind, name, attrs)
   tee({ kind, name, ts: time.toISOString(), attrs, resource, scope, body })
   const stored = persist({ kind, name, attrs })
+  health.eventCount++
+  health.lastEventAt = time.toISOString()
+  health.lastEventArrivedAt = new Date().toISOString()
+  if (name.includes('api_request')) {
+    health.apiRequestCount++
+    health.lastApiRequestAt = time.toISOString()
+  }
   if (opts.quiet) return
+
+  // Unknown-event alert (Phase 4): first sighting of an event name that ingest
+  // does not persist. Keys-only census still records it; this is the loud hint.
+  if (!seenEventNames.has(name)) {
+    seenEventNames.add(name)
+    try {
+      const { ALLOW } = require('./src/store.js')
+      if (!ALLOW[name]) {
+        console.log(yellow(`  ? first sighting of ${bold(name)} — NOT persisted (census + /event-coverage still record its keys)`))
+      }
+    } catch { /* store unavailable; hint skipped */ }
+  }
   if (opts.only && !opts.only.some((f) => name.includes(f))) return
 
   const paint = colorForEvent(name)
@@ -420,11 +553,13 @@ function formatValue(v) {
 // ---------------------------------------------------------------------------
 
 function handleLogs(payload) {
+  let n = 0
   for (const rl of payload.resourceLogs || []) {
     const resource = attributesToObject(rl.resource?.attributes)
     for (const sl of rl.scopeLogs || []) {
       const scope = sl.scope?.name || null
       for (const lr of sl.logRecords || []) {
+        n++
         const attrs = attributesToObject(lr.attributes)
         const body = anyValue(lr.body)
         // Claude Code puts the event name in `event.name`; older/other emitters
@@ -443,9 +578,11 @@ function handleLogs(payload) {
       }
     }
   }
+  return n
 }
 
 function handleMetrics(payload) {
+  let n = 0
   for (const rm of payload.resourceMetrics || []) {
     const resource = attributesToObject(rm.resource?.attributes)
     for (const sm of rm.scopeMetrics || []) {
@@ -454,6 +591,7 @@ function handleMetrics(payload) {
         // A metric is exactly one of sum / gauge / histogram / summary.
         const series = m.sum || m.gauge || m.histogram || m.exponentialHistogram || m.summary
         for (const dp of series?.dataPoints || []) {
+          n++
           const attrs = attributesToObject(dp.attributes)
           const value = dp.asInt !== undefined ? Number(dp.asInt)
             : dp.asDouble !== undefined ? Number(dp.asDouble)
@@ -472,14 +610,17 @@ function handleMetrics(payload) {
       }
     }
   }
+  return n
 }
 
 function handleTraces(payload) {
+  let n = 0
   for (const rs of payload.resourceSpans || []) {
     const resource = attributesToObject(rs.resource?.attributes)
     for (const ss of rs.scopeSpans || []) {
       const scope = ss.scope?.name || null
       for (const span of ss.spans || []) {
+        n++
         const attrs = attributesToObject(span.attributes)
         const durMs = span.endTimeUnixNano && span.startTimeUnixNano
           ? Number((BigInt(span.endTimeUnixNano) - BigInt(span.startTimeUnixNano)) / 1000000n)
@@ -496,6 +637,7 @@ function handleTraces(payload) {
       }
     }
   }
+  return n
 }
 
 // ---------------------------------------------------------------------------
@@ -527,14 +669,18 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   if (req.method !== 'POST') {
     const url = req.url.split('?')[0]
-    if (url === '/state') return serveState(res)
+    if (url === '/state') return serveState(res, req.url)
     if (url === '/widget' || url === '/widget.html') return serveWidget(res)
     if (url === '/dashboard' || url === '/dashboard.html') return serveHtml(res, DASH_PATH)
     if (url === '/dashboard-data') return serveDashboardData(res, req.url)
+    if (url === '/healthz') return serveHealthz(res)
+    if (url === '/readyz') return serveReadyz(res)
+    if (url === '/tracking-status' || url === '/tracking') return serveTrackingStatus(res)
+    if (url === '/event-coverage' || url === '/coverage') return serveEventCoverage(res)
     if (url === '/' && store) return serveWidget(res)
     // A plain GET is handy as a liveness check while wiring things up.
     res.writeHead(200, { 'content-type': 'text/plain' })
-    return res.end('TokenBench collector. GET /widget for the dashboard, /state for JSON. POST OTLP/HTTP JSON to /v1/logs, /v1/metrics, /v1/traces.\n')
+    return res.end('TokenBench collector. GET /widget for the dashboard, /state for JSON, /healthz /readyz /tracking-status for health. POST OTLP/HTTP JSON to /v1/logs, /v1/metrics, /v1/traces.\n')
   }
 
   // Widget mutations (task-type override P1-2, editable daily budget P0-5). Must
@@ -555,6 +701,7 @@ const server = http.createServer(async (req, res) => {
 
   const ct = (req.headers['content-type'] || '').toLowerCase()
   if (ct.includes('protobuf') || (buf.length && buf[0] !== 0x7b /* '{' */)) {
+    health.malformedRequestCount++
     console.error(
       red(`  ! ${req.url} arrived as protobuf, not JSON.`) +
         ` Set ${bold('OTEL_EXPORTER_OTLP_PROTOCOL=http/json')} and restart Claude Code.`
@@ -567,12 +714,15 @@ const server = http.createServer(async (req, res) => {
   try {
     payload = JSON.parse(buf.toString('utf8'))
   } catch (e) {
+    health.malformedRequestCount++
     console.error(red(`  ! ${req.url}: body is not valid JSON — ${e.message}`))
     res.writeHead(400, { 'content-type': 'application/json' })
     return res.end('{}')
   }
 
   requestCount++
+  health.otlpRequestCount++
+  health.lastRequestAt = new Date().toISOString()
   if (opts.raw) {
     console.log(dim(`\n--- raw ${req.method} ${req.url} (${buf.length} bytes) ---`))
     console.log(JSON.stringify(payload, null, 2))
@@ -580,13 +730,20 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const url = req.url.split('?')[0]
-    if (url === '/v1/logs') handleLogs(payload)
-    else if (url === '/v1/metrics') handleMetrics(payload)
-    else if (url === '/v1/traces') handleTraces(payload)
+    const apiBefore = health.apiRequestCount
+    let events = 0
+    if (url === '/v1/logs') events = handleLogs(payload)
+    else if (url === '/v1/metrics') events = handleMetrics(payload)
+    else if (url === '/v1/traces') events = handleTraces(payload)
     else {
       // Unknown path: still show it rather than dropping it silently.
       console.log(yellow(`\n  ? POST ${url} — unrecognised OTLP path, ${buf.length} bytes`))
       if (!opts.raw) console.log(dim(JSON.stringify(payload).slice(0, 500)))
+    }
+    health.kinds[url] = (health.kinds[url] || 0) + 1
+    if (!opts.quiet) {
+      const apiNew = health.apiRequestCount - apiBefore
+      console.log(dim(`  ← ${url} · ${events} events${apiNew ? `, ${apiNew} api_request` : ''} · ${(buf.length / 1024).toFixed(1)} KB`))
     }
   } catch (e) {
     console.error(red(`  ! error handling ${req.url}: ${e.stack}`))
@@ -606,14 +763,157 @@ server.on('error', (e) => {
   throw e
 })
 
-server.listen(opts.port, opts.host, () => {
+const STALE_AFTER_MS = (Number.isFinite(opts.staleAfter) && opts.staleAfter > 0 ? opts.staleAfter : 15) * 60000
+
+// Phase 1: a silent pipe is a broken pipe. Warn in-console after --stale-after
+// minutes without telemetry. (Skipped in --check mode: runCheck connects to the
+// port rather than binding it, so our own listener would answer the probe.)
+if (!opts.check) {
+  setInterval(checkStale, 30000).unref()
+
+  server.listen(opts.port, opts.host, () => {
+    if (!['127.0.0.1', 'localhost', '::1'].includes(opts.host)) {
+      console.warn(yellow(`  ! bound to ${opts.host} — this instance serves ANY interface. Anyone who can reach it`))
+      console.warn(yellow('    can POST telemetry or relay requests through the proxy. Loopback-only (127.0.0.1) is the default for a reason.'))
+    }
+    console.log('')
+    console.log(bold('  TokenBench') + dim(' — Phase 1 collector'))
+    console.log(dim(`  listening on http://${opts.host}:${opts.port}  (/v1/logs, /v1/metrics, /v1/traces)`))
+    console.log(dim('  health: /healthz · /readyz · /tracking-status'))
+    console.log('')
+    console.log(dim('  In another terminal:  tb-claude  (or: source env.sh && claude)'))
+    console.log(dim('  Then run any prompt. Ctrl-C here for the schema summary.  node collector.js --check re-verifies the pipe.'))
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Stale warning (Phase 1) — "is the pipe alive?" must be answerable by glance.
+// The message never claims "nothing happened"; idle and broken are different.
+// ---------------------------------------------------------------------------
+
+function checkStale() {
+  const now = Date.now()
+  // Re-warn at most every 5 minutes so a long-running collector stays quiet
+  // between actual problems.
+  const quietIdle = health.lastWarnedAt && now - health.lastWarnedAt < 5 * 60000
+
+  if (!health.lastEventAt) {
+    if (now - health.startedAt.getTime() > 90_000 && !quietIdle) {
+      health.lastWarnedAt = now
+      console.warn('')
+      console.warn(yellow(`  ! no telemetry has ever arrived (collector up ${Math.round((now - health.startedAt.getTime()) / 1000)}s).`))
+      console.warn(dim('    Either Claude is not running, or it was launched without TokenBench telemetry.'))
+      console.warn(dim('    Fix: run claude through  tb-claude   (diagnose with: node collector.js --check)'))
+    }
+    return
+  }
+
+  const idleMs = now - new Date(health.lastEventAt).getTime()
+  if (idleMs > STALE_AFTER_MS && !quietIdle) {
+    health.lastWarnedAt = now
+    console.warn('')
+    console.warn(yellow(`  ! no telemetry for ${Math.round(idleMs / 60000)}m.`))
+    console.warn(dim('    Claude is idle, or it is running without TokenBench telemetry (use tb-claude).'))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pipe check (Phase 1) — `node collector.js --check`. Verifies the four things
+// that must line up for a terminal Claude Code session to be measured: a
+// collector on the port, the OTLP env vars in THIS shell, the claude binary,
+// and end-to-end arrival via a probe POST. Exits non-zero on a broken pipe.
+// ---------------------------------------------------------------------------
+
+async function runCheck(opts) {
+  const net = require('node:net')
+  const { execFileSync } = require('node:child_process')
+
+  let failed = false
+  const out = []
+  const ok = (name, detail) => out.push(`${green('✓')} ${name}${detail ? dim(` — ${detail}`) : ''}`)
+  const bad = (name, detail) => { failed = true; out.push(`${red('x')} ${name}${detail ? dim(` — ${detail}`) : ''}`) }
+  const warn_ = (name, detail) => out.push(`${yellow('!')} ${name}${detail ? dim(` — ${detail}`) : ''}`)
+
   console.log('')
-  console.log(bold('  TokenBench') + dim(' — Phase 1 collector'))
-  console.log(dim(`  listening on http://${opts.host}:${opts.port}  (/v1/logs, /v1/metrics, /v1/traces)`))
+  console.log(bold('  TokenBench pipe check'))
+
+  // 1. Is anything listening on the collector port?
+  const listening = await new Promise((resolve) => {
+    const sock = net.connect({ host: opts.host, port: opts.port })
+    sock.once('connect', () => { sock.destroy(); resolve(true) })
+    sock.once('error', () => resolve(false))
+  })
+  if (listening) ok(`collector on ${opts.host}:${opts.port}`, 'reachable')
+  else bad(`no collector on ${opts.host}:${opts.port}`, 'start it with: node collector.js --db tokenbench.db --tokens --proxy')
+
+  // env.sh points at a DIFFERENT port than the one being checked — claude
+  // would emit to the env endpoint, not this check.
+  const envEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || ''
+  const envPort = Number((envEndpoint.match(/:\d+$/) || [])[0]?.slice(1) || 0)
+  if (envPort && envPort !== opts.port) {
+    warn_('OTEL_EXPORTER_OTLP_ENDPOINT', `points at :${envPort} but this check probed :${opts.port} — they must match`)
+  }
+
+  // 2. The telemetry env vars of THIS shell — the shell that will run claude.
+  const proto = process.env.OTEL_EXPORTER_OTLP_PROTOCOL
+  if (proto && proto !== 'http/json') bad('OTEL_EXPORTER_OTLP_PROTOCOL', `is '${proto}', but the collector only accepts http/json`)
+  for (const k of ['CLAUDE_CODE_ENABLE_TELEMETRY', 'OTEL_EXPORTER_OTLP_PROTOCOL', 'OTEL_EXPORTER_OTLP_ENDPOINT', 'OTEL_LOGS_EXPORTER']) {
+    const v = process.env[k]
+    if (v === undefined) warn_(k, 'unset — claude will emit nothing unless env.sh is sourced')
+    else ok(k, v)
+  }
+
+  // 3. The claude binary.
+  try {
+    const bin = execFileSync('which', ['claude'], { encoding: 'utf8' }).trim()
+    ok('claude binary', bin)
+  } catch {
+    bad('claude binary', 'not found on PATH')
+  }
+
+  // 4. End-to-end probe: POST one OTLP log record, confirm HTTP acceptance.
+  if (listening) {
+    try {
+      const probe = await fetch(`http://${opts.host}:${opts.port}/v1/logs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          resourceLogs: [{
+            scopeLogs: [{
+              logRecords: [{
+                timeUnixNano: '0',
+                attributes: [{ key: 'event.name', value: { stringValue: 'tokenbench.doctor' } }],
+              }],
+            }],
+          }],
+        }),
+      })
+      if (probe.ok) ok('OTLP probe POST /v1/logs', `HTTP ${probe.status}`)
+      else bad('OTLP probe POST /v1/logs', `HTTP ${probe.status}`)
+    } catch (e) {
+      bad('OTLP probe POST /v1/logs', e.message)
+    }
+  }
+
+  // 5. Progressive endpoint (feature-flag the arrival confirmation the running
+  //    collector may predate).
+  if (listening) {
+    try {
+      const st = await (await fetch(`http://${opts.host}:${opts.port}/tracking-status`)).json()
+      ok('tracking-status endpoint', `${st.status}${st.store === false ? ' (store disabled — add --db)' : ''}`)
+    } catch {
+      warn_('tracking-status endpoint', 'not available — the running collector predates this build; restart it')
+    }
+  }
+
+  console.log(out.join('\n'))
   console.log('')
-  console.log(dim('  In another terminal:  source env.sh && claude'))
-  console.log(dim('  Then run any prompt. Ctrl-C here for the schema summary.'))
-})
+  console.log(failed
+    ? red('  pipe is NOT fully wired — fix the items above, then launch claude via tb-claude.')
+    : green('  pipe looks wired. Launch claude with:  tb-claude'))
+  console.log('')
+  return failed ? 1 : 0
+}
 
 // ---------------------------------------------------------------------------
 // Shutdown summary
@@ -650,6 +950,7 @@ function shutdown() {
     const day = store.getDaily()
     console.log(dim(`    today ${day.local_date}: $${(day.cost_micros / 1e6).toFixed(4)} over ${day.request_count} requests`))
     console.log('')
+    if (cliScanner) cliScanner.stop()
     store.close()
   }
 

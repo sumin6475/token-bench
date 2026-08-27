@@ -24,7 +24,10 @@
 
 const http = require('node:http')
 const https = require('node:https')
+const dns = require('node:dns')
 const { URL } = require('node:url')
+const { promisify } = require('node:util')
+const lookup = promisify(dns.lookup)
 
 // ---------------------------------------------------------------------------
 // Routing — pure, so tests never need a socket.
@@ -47,7 +50,7 @@ const PREFIXES = {
 function resolveRoute(pathname, headers, { defaultUpstream, localUpstream }) {
   const headerUpstream = headers && headers['x-tb-upstream']
   if (headerUpstream) {
-    return { upstreamBase: headerUpstream, forwardPath: pathname, provider: null }
+    return { upstreamBase: headerUpstream, forwardPath: pathname, provider: null, headerDriven: true }
   }
   const m = pathname.match(/^\/(openai|anthropic|local|jan)(\/.*|$)/)
   if (m) {
@@ -56,9 +59,9 @@ function resolveRoute(pathname, headers, { defaultUpstream, localUpstream }) {
     // Both /local (desktop app server) and /jan (jan serve CLI) are local
     // models: cost 0, throughput shown instead.
     const provider = key === 'jan' ? 'local' : key
-    return { upstreamBase, forwardPath: m[2] || '/', provider }
+    return { upstreamBase, forwardPath: m[2] || '/', provider, headerDriven: false }
   }
-  return { upstreamBase: defaultUpstream, forwardPath: pathname, provider: null }
+  return { upstreamBase: defaultUpstream, forwardPath: pathname, provider: null, headerDriven: false }
 }
 
 // ---------------------------------------------------------------------------
@@ -138,15 +141,95 @@ function parseAnthropic(text) {
   return { model, id, inputTokens: input, cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation, outputTokens: output }
 }
 
+/**
+ * Gemini (generativelanguage.googleapis.com) usage extraction — Phase 5.
+ * usageMetadata lives on the FINAL chunk of an SSE stream (and on the root of
+ * a non-stream response), in the same position OpenAI puts `usage`.
+ *
+ *   usageMetadata: {
+ *     promptTokenCount,          // may include cached content tokens
+ *     candidatesTokenCount,
+ *     cachedContentTokenCount,   // the cache-read portion of promptTokenCount
+ *     thoughtsTokenCount
+ *   }
+ *
+ * Mirror of parseOpenAI: split cached out of the prompt count, treat cache
+ * writes as 0 (Gemini does not bill distinct cache writes).
+ */
+function parseGemini(text) {
+  const trimmed = text.trimStart()
+  let o = null
+  if (trimmed.startsWith('{')) {
+    try { o = JSON.parse(text) } catch { return null }
+  } else {
+    const parts = sseDataObjects(text)
+    if (!parts.length) return null
+    o = parts[parts.length - 1]
+  }
+  const u = o && o.usageMetadata ? o.usageMetadata : null
+  if (!u) return null
+  const cached = u.cachedContentTokenCount || 0
+  return {
+    model: (o.modelVersion && o.modelVersion.replace(/^models\//, '')) || o.model || null,
+    id: null,
+    inputTokens: Math.max(0, (u.promptTokenCount || 0) - cached),
+    cacheReadTokens: cached,
+    cacheCreationTokens: 0,
+    outputTokens: u.candidatesTokenCount || 0,
+  }
+}
+
 function inferProvider(upstreamHref, override) {
   if (override) return String(override).toLowerCase()
   let host = ''
   try { host = new URL(upstreamHref).hostname } catch { /* fall through */ }
   if (/(^|\.)anthropic\.com$/.test(host)) return 'anthropic'
   if (/(^|\.)openai\.com$/.test(host)) return 'openai'
+  if (/(^|\.)generativelanguage\.(googleapis\.)?com$/.test(host) || /(^|\.)gemini\.google\.com$/.test(host)) return 'gemini'
   if (['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(host)) return 'local'
   return 'openai' // most OpenAI-compatible third parties speak the OpenAI shape
 }
+
+// ---------------------------------------------------------------------------
+// Upstream safety (Phase 7 — SSRF guard)
+//
+// x-tb-upstream lets a caller choose the upstream for one request. That is a
+// localhost convenience feature, but if the proxy were ever reachable from
+// another machine it becomes an open relay into the caller's network.
+// Private/loopback/link-local targets are refused by default; --allow-private-
+// upstream turns the guard off for the fleet's own /local and /jan routes
+// (which ARE loopback by design and never pass the header).
+// ---------------------------------------------------------------------------
+
+const PRIVATE_V4 = /^(0\.|10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/
+
+function isPrivateIp(ip) {
+  if (!ip) return false
+  const v4 = ip.startsWith('::ffff:') ? ip.slice(7) : null
+  const host = v4 || ip
+  const lower = host.toLowerCase()
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return PRIVATE_V4.test(host)
+  return lower === '::1' || lower === '::' || /^(fc|fd|fe[89ab])/.test(lower)
+}
+
+/**
+ * Validate a target the x-tb-upstream header pointed at. Returns an error
+ * string when refused, null when allowed. Resolves DNS to catch a public
+ * hostname that points back at a private address.
+ */
+async function validateUpstream(target, { allowPrivate = false } = {}) {
+  const url = target instanceof URL ? target : new URL(String(target))
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return `unsupported scheme ${url.protocol}`
+  }
+  if (allowPrivate) return null
+  try {
+    const { address } = await lookup(url.hostname)
+    if (isPrivateIp(address)) return `upstream ${url.hostname} resolves to private address ${address}`
+  } catch { /* DNS failure surfaces as an upstream error later, not here */ }
+  return null
+}
+
 
 // ---------------------------------------------------------------------------
 // Server factory
@@ -164,40 +247,58 @@ const yellow = c('33')
  * Create the proxy http.Server. `store` may be null (forward-only, warn once).
  * Caller owns listen()/close().
  */
-function createProxyServer({ store = null, defaultUpstream = 'https://api.openai.com', localUpstream = 'http://127.0.0.1:1337', quiet = false } = {}) {
+function createProxyServer({ store = null, defaultUpstream = 'https://api.openai.com', localUpstream = 'http://127.0.0.1:1337', quiet = false, allowPrivateUpstream = false } = {}) {
   let requestCounter = 0
 
   function recordUsage({ method, target, provider, reqBody, respBody, durationMs }) {
     const pathname = target.pathname
     const respText = respBody.toString('utf8')
+
+    const isGemini =
+      provider === 'gemini' || pathname.includes('generateContent') ||
+      /(^|\.)generativelanguage\.(googleapis\.)?com$/.test(target.hostname)
     const isAnthropic = pathname.includes('/messages') || provider === 'anthropic'
-    const parsed = (isAnthropic ? parseAnthropic : parseOpenAI)(respText)
+    const parsed = isGemini ? parseGemini(respText) : (isAnthropic ? parseAnthropic : parseOpenAI)(respText)
 
-    if (!parsed) {
-      if (!quiet) console.log(dim(`  ${method} ${pathname} — no usage in response, nothing stored`))
-      return
-    }
+    // Capture truth (Phase 3): a request that reached the proxy but gave us no
+    // usage is STORED as usage_status 'no_usage'/'empty_response' with zero
+    // tokens and cost_source 'unknown'. Never silently dropped, never guessed.
+    const u = parsed || {}
+    const usageStatus = parsed ? 'parsed' : (respBody.length ? 'no_usage' : 'empty_response')
+    const usageReason = parsed
+      ? null
+      : `response has no ${isGemini ? 'usageMetadata' : 'usage'} object` +
+        (respBody.length ? '' : ' (empty body)')
 
-    let model = parsed.model
+    let model = u.model
     if (!model) { try { model = JSON.parse(reqBody.toString('utf8')).model } catch { /* leave null */ } }
-    const requestId = parsed.id || `proxy-${provider}-${++requestCounter}-${Date.now()}`
+    const requestId = u.id || `proxy-${provider}-${++requestCounter}-${Date.now()}`
 
     if (!store) {
-      if (!quiet) console.log(dim(`  ${method} ${pathname} ${model || '?'} — ${parsed.inputTokens}+${parsed.outputTokens} tok (no store)`))
+      if (!quiet) {
+        const tok = parsed ? `${u.inputTokens}+${u.outputTokens} tok` : yellow(`no usage (${usageStatus})`)
+        console.log(dim(`  ${method} ${pathname} ${model || '?'} — ${tok} (no store)`))
+      }
       return
     }
 
-    const r = store.ingestProxyRequest({ requestId, provider, model, durationMs, ...parsed })
+    const r = store.ingestProxyRequest({
+      requestId, provider, model, durationMs, usageStatus, usageReason, ...u,
+    })
     if (quiet) return
     if (r.action === 'duplicate') {
       console.log(dim(`  ${method} ${pathname} — duplicate ${requestId}, totals unchanged`))
       return
     }
+    if (r.usageStatus && r.usageStatus !== 'parsed') {
+      console.log(`  ${yellow(provider)} ${bold(model || '?')} ${dim('·')} ${yellow(`usage unavailable (${r.usageStatus})`)} — request counted, cost unknown`)
+      return
+    }
     const cost = r.costKnown ? `$${(r.costMicros / 1e6).toFixed(6)}` : yellow('cost unknown — model not in pricing.json')
-    const cached = parsed.cacheReadTokens ? ` ${dim('·')} ${parsed.cacheReadTokens} cached` : ''
+    const cached = u.cacheReadTokens ? ` ${dim('·')} ${u.cacheReadTokens} cached` : ''
     console.log(
       `  ${green(provider)} ${bold(model || '?')} ${dim('·')} ` +
-        `${parsed.inputTokens} fresh + ${parsed.outputTokens} out${cached} ${dim('·')} ${cost}`
+        `${u.inputTokens} fresh + ${u.outputTokens} out${cached} ${dim('·')} ${cost}`
     )
   }
 
@@ -205,14 +306,15 @@ function createProxyServer({ store = null, defaultUpstream = 'https://api.openai
     const chunks = []
     req.on('data', (ch) => chunks.push(ch))
     req.on('error', () => { /* client hung up */ })
-    req.on('end', () => {
+    req.on('end', async () => {
       const reqBody = Buffer.concat(chunks)
 
       if (req.method === 'GET' && req.url.split('?')[0] === '/') {
         res.writeHead(200, { 'content-type': 'text/plain' })
         return res.end(
           'TokenBench proxy. Base-URL routes: /openai/v1, /anthropic/v1, /local/v1 (Jan local server), ' +
-          'bare /v1 -> default upstream. Headers x-tb-upstream / x-tb-provider override.\n'
+          'bare /v1 -> default upstream. Headers x-tb-upstream / x-tb-provider override. ' +
+          'x-tb-upstream is restricted to public hosts by default.\n'
         )
       }
 
@@ -224,6 +326,16 @@ function createProxyServer({ store = null, defaultUpstream = 'https://api.openai
       try { target = new URL(route.forwardPath + query, route.upstreamBase) } catch {
         res.writeHead(400, { 'content-type': 'application/json' })
         return res.end(JSON.stringify({ error: { message: `bad upstream: ${route.upstreamBase}` } }))
+      }
+
+      // SSRF guard: header-driven upstreams default to public hosts only.
+      if (route.headerDriven) {
+        const refused = await validateUpstream(target, { allowPrivate: allowPrivateUpstream })
+        if (refused) {
+          if (!quiet) console.error(red(`  ! refused x-tb-upstream: ${refused}`))
+          res.writeHead(400, { 'content-type': 'application/json' })
+          return res.end(JSON.stringify({ error: { message: `TokenBench proxy refused upstream: ${refused}` } }))
+        }
       }
 
       // x-tb-provider header > route prefix > host inference.
@@ -264,6 +376,9 @@ function createProxyServer({ store = null, defaultUpstream = 'https://api.openai
       })
 
       upReq.on('error', (e) => {
+        // A request that never reached an upstream answered nothing — count it
+        // so "calls happened but nothing was recorded" is visible, not silent.
+        try { if (store) store.stats.proxyUpstreamErrors++ } catch { /* non-fatal */ }
         console.error(red(`  ! upstream error: ${e.message}`))
         if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ error: { message: `proxy upstream error: ${e.message}` } }))
@@ -278,5 +393,5 @@ function createProxyServer({ store = null, defaultUpstream = 'https://api.openai
 module.exports = {
   createProxyServer, resolveRoute,
   // exported for tests
-  sseDataObjects, parseOpenAI, parseAnthropic, inferProvider, PREFIXES,
+  sseDataObjects, parseOpenAI, parseAnthropic, parseGemini, inferProvider, validateUpstream, isPrivateIp, PREFIXES,
 }

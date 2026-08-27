@@ -1,22 +1,26 @@
 # TokenBench — desktop shell (Tauri)
 
 The native Mac window that closes the two Phase 3 gaps the served widget left
-open: **P0-7** (always-on-top, frameless, remembers position) and **P0-10**
+open: **P0-7** (optional always-on-top, remembers position and preference) and **P0-10**
 (the collector runs as a managed sidecar — started on launch, killed on quit,
 `:4318` always released).
 
 Nothing about the widget or the collector changed. This shell just:
 
-- opens a frameless, always-on-top, fixed-size window pointed at
+- opens a compact fixed-size window pointed at
   `http://localhost:4318/widget` (the page the collector already serves), and
 - owns the collector's lifecycle from Rust (`src-tauri/src/main.rs`): spawns
   `node collector.js --db <app-data>/tokenbench.db --tokens --proxy` on launch
-  and kills it on exit. `--proxy` means the same sidecar also serves the
-  provider proxy on `:8787` — point Jan's provider base URLs at
-  `http://localhost:8787/{openai,anthropic,local}/v1` and their usage appears
-  in the widget's "Today by source" panel (see the main README → Using with Jan).
+  and kills it on exit. `--proxy` means the same sidecar also exposes optional
+  OpenAI- and Anthropic-compatible routes on `:8787`.
 
 `tauri-plugin-window-state` persists window position and size across restarts.
+Use **Window → Float on Top** to toggle pinning; the choice persists across launches.
+
+The sidecar also discovers running Claude Code, Codex, and Pi processes. Codex
+and Pi usage is read directly from their local JSONL session metadata, so every
+recent session can be selected as the widget's gauge source. Message content is
+never ingested.
 
 ## Prerequisites (one-time)
 
@@ -46,8 +50,9 @@ The window appears, the collector starts automatically (watch the terminal for
 `tokenbench: collector started …`), and the gauge is live. Quit the window and
 the terminal prints `tokenbench: collector stopped` — `:4318` is freed.
 
-To point at real Claude Code traffic, launch Claude from a shell that sourced
-the repo's `env.sh`, exactly as before — the app's collector is the same one.
+Codex and Pi require no setup. For Claude Code, launch through `../tb-claude`
+or export the OTLP variables documented in the main README before starting
+`claude`.
 
 ## Build a distributable
 
@@ -95,9 +100,45 @@ npm run tauri icon path/to/your-icon.png
 
 | File | |
 | :--- | :--- |
-| `src-tauri/src/main.rs` | window + collector sidecar lifecycle |
-| `src-tauri/tauri.conf.json` | window flags (always-on-top, frameless, transparent) |
+| `src-tauri/src/main.rs` | window + collector sidecar lifecycle + health check |
+| `src-tauri/tauri.conf.json` | window flags (always-on-top, frameless, transparent) + macOS bundle config |
+| `src-tauri/entitlements.plist` | non-sandboxed Developer ID signing entitlements |
 | `src-tauri/Cargo.toml` | Rust deps (tauri, window-state plugin) |
 | `src-tauri/capabilities/default.json` | window permissions |
 | `src-tauri/icons/` | generated app icon set |
 | `frontend/index.html` | fallback shown only if the collector is unreachable |
+| `APP_STORE_GUIDE.md` | DMG distribution decision, signing, and notarization guide |
+
+## Pipe health monitoring
+
+The widget now shows a **pipe pill** next to the model name indicating telemetry status:
+- `live` — telemetry flowing (healthy)
+- `idle` — no recent telemetry (Claude may be idle)
+- `not configured` — no telemetry ever received
+- `events, no api requests` — events arriving but no API requests seen
+
+The app also includes a **Check Collector Health** menu item (TokenBench → Check Collector Health) that prints the collector status to the console.
+
+For full diagnostics, run:
+```bash
+node collector.js --check
+```
+
+## Distribution decision
+
+TokenBench targets a signed and notarized DMG distributed through GitHub
+Releases. The Mac App Store build is intentionally not a product target: App
+Sandbox prevents reliable process discovery, `tb-claude` / `tokenbench run`,
+and reading Codex/Pi session metadata from the user's home directory.
+
+Prepare a release with:
+
+```bash
+cd desktop
+./build.sh --release 0.3.0
+gh release create v0.3.0 src-tauri/target/release/bundle/dmg/TokenBench.dmg --generate-notes
+```
+
+The release command updates the npm, Tauri, and Cargo package versions together,
+then signs, notarizes, and builds the DMG. See [APP_STORE_GUIDE.md](APP_STORE_GUIDE.md)
+for the rationale and required signing environment variables.

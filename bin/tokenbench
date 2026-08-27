@@ -1,0 +1,213 @@
+#!/usr/bin/env node
+'use strict'
+
+/**
+ * TokenBench launcher CLI (Phase 2).
+ *
+ *   tokenbench claude [args...]        launch Claude Code with the telemetry
+ *                                       pipe guaranteed (collector auto-start +
+ *                                       env export + pre-flight probe + summary)
+ *   tokenbench run -- <cmd> [args...]  exec a CLI with OpenAI/Anthropic base
+ *                                       URLs pointed at the proxy, so its usage
+ *                                       lands in the store (Phase 3 wrapper)
+ *   tokenbench status                  one-line tracking status
+ *   tokenbench doctor                  same as `node collector.js --check`
+ *
+ * `tokenbench claude` removes the #1 way tracking silently fails: a Claude
+ * Code session launched from a shell that never sourced env.sh emits nothing.
+ * The launcher exports the OTLP env vars itself, so the source file is no
+ * longer a requirement.
+ *
+ * Honest limits (never implied as capture): `tokenbench run` only captures
+ * tools that honor OPENAI_BASE_URL / ANTHROPIC_BASE_URL. Everything else
+ * bypasses the proxy and is NOT measured. That is stated at launch, not
+ * hidden.
+ */
+
+const { spawn, spawnSync } = require('node:child_process')
+const fs = require('node:fs')
+const path = require('node:path')
+
+const ROOT = path.resolve(__dirname, '..')
+const COLLECTOR_URL = process.env.TOKENBENCH_COLLECTOR_URL || 'http://127.0.0.1:4318'
+const PROXY_URL = process.env.TOKENBENCH_PROXY_URL || 'http://127.0.0.1:8787'
+const DB = path.resolve(process.env.TOKENBENCH_DB || path.join(ROOT, 'tokenbench.db'))
+const COLLECTOR_LOG = path.join(ROOT, 'collector.log')
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const reachable = async (url) => {
+  try { return (await fetch(url)).ok } catch { return false }
+}
+const urlPort = (url, def) => { try { return new URL(url).port || def } catch { return def } }
+
+function printHelp() {
+  console.log(`TokenBench launcher
+
+  tokenbench claude [args...]         launch Claude Code, telemetry guaranteed
+  tokenbench run -- <cmd> [args...]   exec <cmd> with proxy base URLs
+  tokenbench status                   one-line tracking status
+  tokenbench doctor                   pipe diagnostics (same as --check)
+
+Env overrides: TOKENBENCH_COLLECTOR_URL (default http://127.0.0.1:4318),
+TOKENBENCH_PROXY_URL (default http://127.0.0.1:8787), TOKENBENCH_DB.`)
+}
+
+async function ensureCollector() {
+  if (await reachable(`${COLLECTOR_URL}/healthz`)) return true
+  console.log(`TokenBench: collector not running at ${COLLECTOR_URL} — starting it (db: ${DB}, log: ${COLLECTOR_LOG})`)
+  fs.mkdirSync(path.dirname(COLLECTOR_LOG), { recursive: true })
+  const log = fs.openSync(COLLECTOR_LOG, 'a')
+  // The collector must bind the SAME ports the URLs claim, or the health check
+  // would find nothing (default 4318/8787 may already be taken by another mode).
+  const port = urlPort(COLLECTOR_URL, '4318')
+  const proxy = urlPort(PROXY_URL, '8787')
+  const child = spawn(
+    process.execPath,
+    [path.join(ROOT, 'collector.js'), '--db', DB, '--tokens', '--proxy', proxy, '--port', port],
+    { detached: true, stdio: ['ignore', log, log] }
+  )
+  child.unref()
+  for (let i = 0; i < 40; i++) {
+    if (await reachable(`${COLLECTOR_URL}/healthz`)) return true
+    await sleep(250)
+  }
+  return false
+}
+
+/** One OTLP log record through /v1/logs; HTTP 200 means the wire accepts JSON. */
+async function preflightProbe() {
+  try {
+    const r = await fetch(`${COLLECTOR_URL}/v1/logs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        resourceLogs: [{
+          scopeLogs: [{
+            logRecords: [{
+              timeUnixNano: String(BigInt(Date.now()) * 1000000n),
+              attributes: [{ key: 'event.name', value: { stringValue: 'tokenbench.launcher' } }],
+            }],
+          }],
+        }],
+      }),
+    })
+    return r.ok
+  } catch { return false }
+}
+
+function exportOtlpEnv() {
+  process.env.CLAUDE_CODE_ENABLE_TELEMETRY = '1'
+  process.env.OTEL_EXPORTER_OTLP_PROTOCOL = 'http/json'
+  process.env.OTEL_EXPORTER_OTLP_ENDPOINT = COLLECTOR_URL
+  process.env.OTEL_LOGS_EXPORTER = 'otlp'
+  process.env.OTEL_LOGS_EXPORT_INTERVAL = '1000'
+  process.env.OTEL_METRICS_EXPORTER = 'otlp'
+  process.env.OTEL_METRIC_EXPORT_INTERVAL = '1000'
+  process.env.OTEL_METRICS_INCLUDE_ACCOUNT_UUID = 'false'
+}
+
+async function runClaude(args) {
+  if (!(await ensureCollector())) {
+    console.error(`TokenBench: could not start or attach the collector at ${COLLECTOR_URL}. See ${COLLECTOR_LOG}`)
+    return 1
+  }
+  exportOtlpEnv()
+  const ok = await preflightProbe()
+  console.log(`TokenBench: tracking -> ${COLLECTOR_URL}${ok ? '' : '  (!) pre-flight probe FAILED'}`)
+  if (!ok) console.log('TokenBench: continuing anyway, but Claude Code may not emit. Diagnose: tokenbench doctor')
+
+  console.log(`TokenBench: launching claude ${args.join(' ')}`)
+  const child = spawn('claude', args, { stdio: 'inherit' })
+  const code = await new Promise((resolve) => {
+    child.on('exit', resolve)
+    child.on('error', (e) => { console.error(`TokenBench: cannot spawn claude: ${e.message}`); resolve(127) })
+  })
+
+  // Session summary — the same numbers the widget shows, post-run.
+  try {
+    const st = await (await fetch(`${COLLECTOR_URL}/tracking-status`)).json()
+    const state = await (await fetch(`${COLLECTOR_URL}/state`)).json()
+    console.log('')
+    console.log(`TokenBench: session ended (exit ${code})`)
+    console.log(`  tracking: ${st.status}${st.reason ? ` — ${st.reason}` : ''}`)
+    if (state.store && state.daily) {
+      console.log(`  today: $${(state.daily.cost_micros / 1e6).toFixed(4)} · ${state.daily.request_count} requests`)
+      if (state.session && state.session.latest_context_tokens != null) {
+        console.log(`  gauge: ${state.session.latest_context_tokens.toLocaleString()} tokens` +
+          (state.session.contextWindow ? ` / ${state.session.contextWindow.toLocaleString()}` : ' (window unknown)'))
+      }
+    }
+  } catch { /* collector already gone; nothing to summarize */ }
+  return code
+}
+
+async function runCommand(args) {
+  if (!args.length) {
+    console.error('Usage: tokenbench run -- <cmd> [args...]')
+    return 1
+  }
+  if (!(await ensureCollector())) {
+    console.error(`TokenBench: could not start the proxy at ${PROXY_URL}. See ${COLLECTOR_LOG}`)
+    return 1
+  }
+  // The collector may already be running without --proxy; then the base URLs
+  // below point at nothing. Verify the proxy answers before claiming capture.
+  const proxyUp = await reachable(PROXY_URL)
+  if (!proxyUp) {
+    console.warn(`TokenBench: collector is up but the proxy at ${PROXY_URL} does not answer.`)
+    console.warn('TokenBench: restart the collector with --proxy (or run: node collector.js --db tokenbench.db --tokens --proxy) and try again.')
+    console.warn('TokenBench: continuing WITHOUT capture — usage for this run will NOT be recorded.')
+  }
+  process.env.OPENAI_BASE_URL = `${PROXY_URL}/openai/v1`
+  process.env.ANTHROPIC_BASE_URL = `${PROXY_URL}/anthropic/v1`
+  console.log(`TokenBench: ${args[0]} runs with proxy base URLs (${PROXY_URL})`)
+  console.log('TokenBench: only traffic honoring OPENAI_BASE_URL / ANTHROPIC_BASE_URL is captured.')
+
+  const [cmd, ...rest] = args
+  const child = spawn(cmd, rest, { stdio: 'inherit' })
+  return await new Promise((resolve) => {
+    child.on('exit', resolve)
+    child.on('error', (e) => { console.error(`TokenBench: cannot spawn ${cmd}: ${e.message}`); resolve(127) })
+  })
+}
+
+async function status() {
+  try {
+    const st = await (await fetch(`${COLLECTOR_URL}/tracking-status`)).json()
+    console.log(`collector (${COLLECTOR_URL}): ${st.status}${st.reason ? ` — ${st.reason}` : ''}`)
+    if (st.stored) {
+      console.log(`stored: ${st.stored.requests} claude-code requests · proxy: ${st.stored.proxy.requests} (${st.stored.proxy.noUsage} no-usage, ${st.stored.proxy.upstreamErrors} upstream-errors)`)
+    }
+    return 0
+  } catch {
+    console.log(`collector (${COLLECTOR_URL}): NOT RUNNING`)
+    console.log('start it with: node collector.js --db tokenbench.db --tokens --proxy')
+    return 1
+  }
+}
+
+function doctor() {
+  // Same pipe check as `collector.js --check`, but honouring the launcher's
+  // collector URL (a custom TOKENBENCH_COLLECTOR_URL must be probed, not 4318).
+  const r = spawnSync(process.execPath, [
+    path.join(ROOT, 'collector.js'), '--check', '--port', urlPort(COLLECTOR_URL, '4318'),
+  ], { stdio: 'inherit' })
+  return r.status === null ? 1 : r.status
+}
+
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2)
+  if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') { printHelp(); return 0 }
+  if (cmd === 'claude') return await runClaude(rest)
+  if (cmd === 'run') {
+    const i = rest.indexOf('--')
+    return await runCommand(i === -1 ? rest : rest.slice(i + 1))
+  }
+  if (cmd === 'status') return await status()
+  if (cmd === 'doctor') return doctor()
+  console.error(`Unknown command: ${cmd}`)
+  printHelp()
+  return 1
+}
+
+main().then((code) => process.exit(code)).catch((e) => { console.error(e); process.exit(1) })

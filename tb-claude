@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# TokenBench — guaranteed-telemetry launch of Claude Code (Phase 2).
+#
+# Replaces the fragile  source env.sh && claude  with a single command that:
+#   1. starts the collector if it isn't already running (nohup, logs to collector.log)
+#   2. exports the OTLP env vars itself (no per-shell env.sh sourcing to forget)
+#   3. pre-flights the pipe with one probe record before claude starts
+#   4. prints a session summary (tracking status + today's cost) on exit
+#
+# Any args are passed straight through to claude:
+#   tb-claude --continue
+#   tb-claude -p "explain this repo"
+#
+# See also: node collector.js --check  (full pipe diagnostics)
+#           tokenbench doctor          (same, via the CLI)
+
+exec node "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/tokenbench" claude "$@"

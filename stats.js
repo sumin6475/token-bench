@@ -237,6 +237,49 @@ if (proxy.length) {
     const unk = p.unpriced ? yellow(`  ${p.unpriced} unpriced`) : ''
     console.log(`    ${(p.provider || '?').padEnd(9)} ${String(p.n).padStart(4)} req   ${usd(p.cost).padStart(10)}${unk}`)
   }
+  const ps = store.getProxyStats()
+  if (ps.noUsage || ps.upstreamErrors) {
+    console.log(
+      dim(`    capture truth: ${ps.noUsage} usage-unavailable, ${ps.upstreamErrors} upstream-errors — both counted, not dropped`)
+    )
+  }
+}
+
+// --- query_source census (sensitivity) -------------------------------------
+// Every value seen on the wire, with whether it drives the needle. A Claude
+// Code update that introduces a NEW main-thread value shows up HERE as "not
+// driving", instead of silently failing to move the gauge.
+const qsRows = store.db
+  .prepare(`SELECT query_source, COUNT(*) AS n,
+                   SUM(CASE WHEN usage_status IS NULL THEN 0 ELSE 1 END) AS via_proxy
+              FROM requests GROUP BY query_source ORDER BY n DESC`)
+  .all()
+if (qsRows.length) {
+  console.log('')
+  console.log(bold('  Query sources observed (all history)'))
+  for (const r of qsRows) {
+    const drives = MAIN_THREAD_SOURCES.has(r.query_source) ? dim(' ← main thread') : yellow(' not main-road — need manual review')
+    console.log(`    ${(r.query_source || 'unknown').padEnd(22)} ${String(r.n).padStart(4)} req${drives}`)
+  }
+}
+
+// --- wire-schema census (Phase 4) ------------------------------------------
+// Every event type observed (attribute KEYS only, never values). Things ingest
+// deliberately drops still show up here, so a changed wire is visible instead
+// of melting silently.
+const cov = store.getEventCoverage()
+if (cov.length) {
+  console.log('')
+  console.log(bold('  Wire events observed') + dim('  (keys only, no values — PII cannot reach this)' ))
+  const skip = cov.filter((e) => !e.persisted)
+  for (const e of cov) {
+    const tag = e.persisted ? dim(' stored') : yellow(' not-persisted')
+    const keys = e.attributes.length ? dim(`  [${e.attributes.join(', ')}]`) : ''
+    console.log(`    ${(e.kind + ':' + e.name).padEnd(38)} ×${String(e.count).padStart(3)}${tag}` + (e.attributes.length > 60 ? dim('  …') : keys.slice(0, 140)))
+  }
+  if (skip.length) {
+    console.log(yellow(`    ${skip.length} event type(s) not persisted — see README for which and why`))
+  }
 }
 
 // --- compactions -----------------------------------------------------------

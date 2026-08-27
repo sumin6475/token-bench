@@ -205,9 +205,29 @@ class Store {
   constructor(dbPath, { windowsFile = WINDOWS_PATH } = {}) {
     this.db = new DatabaseSync(dbPath)
     this.db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'))
+
+    // Light migration for DBs created before these columns existed. A schema
+    // add must never brick an existing tokenbench.db — a collector whose store
+    // fails to open drops ALL telemetry, which is the failure we're removing.
+    const reqCols = this.db.prepare('PRAGMA table_info(requests)').all().map((c) => c.name)
+    const addCol = (col, sql) => {
+      if (reqCols.includes(col)) return
+      try { this.db.exec(sql) } catch (e) { console.error(`  ! migration: ${col} — ${e.message}`) }
+    }
+    addCol('usage_status', 'ALTER TABLE requests ADD COLUMN usage_status TEXT')
+    addCol('usage_reason', 'ALTER TABLE requests ADD COLUMN usage_reason TEXT')
+
+    const sessCols = this.db.prepare('PRAGMA table_info(sessions)').all().map((c) => c.name)
+    const addSessionCol = (col, sql) => {
+      if (sessCols.includes(col)) return
+      try { this.db.exec(sql) } catch (e) { console.error(`  ! migration: sessions.${col} — ${e.message}`) }
+    }
+    addSessionCol('project', 'ALTER TABLE sessions ADD COLUMN project TEXT')
+    addSessionCol('context_window', 'ALTER TABLE sessions ADD COLUMN context_window INTEGER')
+
     this.windows = loadContextWindows(windowsFile)
     this.pricing = loadPricing() // Phase 4: proxy cost + P1-4 reported-vs-computed
-    this.stats = { requests: 0, compactions: 0, sessions: 0, duplicates: 0, skipped: 0, proxy: 0 }
+    this.stats = { requests: 0, compactions: 0, sessions: 0, duplicates: 0, skipped: 0, proxy: 0, proxyNoUsage: 0, proxyUpstreamErrors: 0 }
 
     this.db
       .prepare(`INSERT INTO schema_meta(key, value) VALUES('written_from', 'schema-observed.md')
@@ -243,6 +263,21 @@ class Store {
           last_seen_at = excluded.last_seen_at,
           model        = COALESCE(excluded.model, sessions.model)`),
 
+      // Codex and Pi expose local JSONL session logs. Unlike proxy rows, those
+      // logs carry a real session id and cwd, and Codex reports its exact
+      // context window. Only usage metadata is ingested; prompts stay on disk.
+      upsertSessionCli: d.prepare(`
+        INSERT INTO sessions (
+          id, started_at, last_seen_at, source, model, project,
+          context_window, task_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          last_seen_at  = excluded.last_seen_at,
+          source        = excluded.source,
+          model         = COALESCE(excluded.model, sessions.model),
+          project       = COALESCE(excluded.project, sessions.project),
+          context_window = COALESCE(excluded.context_window, sessions.context_window)`),
+
       selSetting: d.prepare(`SELECT value FROM settings WHERE key = ?`),
 
       // source/provider/cost_source are parameters now: the Claude Code path
@@ -253,8 +288,9 @@ class Store {
           request_id, session_id, ts, local_date, event_sequence, prompt_id,
           source, provider, model, query_source, speed, terminal_type,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-          context_tokens, cost_micros, cost_source, duration_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          context_tokens, cost_micros, cost_source, duration_ms,
+          usage_status, usage_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(request_id) DO NOTHING`),
 
       // The gauge. Overwrite, never add. Guarded on event_sequence so a
@@ -292,6 +328,22 @@ class Store {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id, event_sequence) DO NOTHING`),
 
+      // Wire-schema census: one row per (kind, name) ever seen, keys only —
+      // never values, so PII and prompt content cannot reach this table.
+      upsertObservation: d.prepare(`
+        INSERT INTO event_observations (event_kind, event_name, first_seen, last_seen, count, attribute_keys_json)
+        VALUES (?, ?, ?, ?, 1, ?)
+        ON CONFLICT(event_kind, event_name) DO UPDATE SET
+          last_seen = excluded.last_seen,
+          count     = event_observations.count + 1,
+          attribute_keys_json = (
+            SELECT json_group_array(value ORDER BY value) FROM (
+              SELECT value FROM json_each(event_observations.attribute_keys_json)
+              UNION
+              SELECT value FROM json_each(excluded.attribute_keys_json)
+            )
+          )`),
+
       // Raw, un-coerced capture for Phase 3 (see schema.sql). Same idempotency
       // key as `compactions`, so it stays in lock-step under retry/replay.
       insertCompactionRaw: d.prepare(`
@@ -324,25 +376,39 @@ class Store {
 
   /**
    * Ingest one flattened collector record. Returns what happened, for logging.
-   * Anything not in the three persisted event types is skipped by design.
+   * Anything not in the three persisted event types is skipped by design — but
+   * every event is still OBSERVED (wire-schema census, keys only) before the
+   * skip, so a changed wire never fails silently.
    */
   ingest(rec) {
     const { kind, name, attrs } = rec
-    const key = kind === 'metric' ? name : name
-    if (!ALLOW[key]) {
+    this.#observe(rec)
+    if (!ALLOW[name]) {
       this.stats.skipped++
       return { action: 'skipped', name }
     }
 
-    const picked = pick(attrs, ALLOW[key])
+    const picked = pick(attrs, ALLOW[name])
     assertNoPii(attrs, picked)
 
-    if (key === 'api_request') return this.#ingestRequest(picked)
-    if (key === 'compaction') return this.#ingestCompaction(picked)
-    if (key === 'claude_code.session.count') return this.#ingestSessionStart(picked)
+    if (name === 'api_request') return this.#ingestRequest(picked)
+    if (name === 'compaction') return this.#ingestCompaction(picked)
+    if (name === 'claude_code.session.count') return this.#ingestSessionStart(picked)
     this.stats.skipped++
     return { action: 'skipped', name }
   }
+
+  /**
+   * Wire-schema census. KEY NAMES ONLY — the observation JSON is a sorted list
+   * of attribute keys, never their values. The PII allowlist can therefore
+   * never be breached through this table: there is no value column at all.
+   */
+  #observe(rec) {
+    const now = new Date().toISOString()
+    const keys = JSON.stringify(Object.keys(rec.attrs || {}).sort())
+    this.q.upsertObservation.run(rec.kind, rec.name || '(unnamed)', now, now, keys)
+  }
+
 
   #ingestSessionStart(a) {
     const sid = str(a['session.id'])
@@ -387,7 +453,8 @@ class Store {
       requestId, sid, ts, day, seq, str(a['prompt.id']),
       'claude-code', 'anthropic', model, querySource, str(a.speed), str(a['terminal.type']),
       inputTokens, outputTokens, cacheRead, cacheCreation,
-      contextTokens, costMicros, 'reported', int(a.duration_ms, null)
+      contextTokens, costMicros, 'reported', int(a.duration_ms, null),
+      null, null
     )
 
     // Idempotency: a retried or replayed event must not inflate any total.
@@ -474,6 +541,13 @@ class Store {
     const model = str(rec.model)
     if (!requestId) return { action: 'skipped', name: 'proxy' }
 
+    // Capture truth (Phase 3): a request that reached the proxy but yielded no
+    // usage is STORED, not dropped — 'no_usage' / 'empty_response' rows keep
+    // the request count honest and the reason visible. NULL on the Claude Code
+    // OTLP path; 'parsed' when usage was extracted.
+    const usageStatus = str(rec.usageStatus) || 'parsed'
+    const usageReason = str(rec.usageReason)
+
     const ts = str(rec.ts) || new Date().toISOString()
     // One session per provider+model so the gauge tracks the latest call to it.
     const sid = str(rec.sessionId) || `proxy:${provider}:${model || 'unknown'}`
@@ -490,6 +564,9 @@ class Store {
       this.pricing,
       rec.cacheTtl // undefined -> defaults to 1h in computeCostMicros
     )
+    // No usage -> no token counts -> cost is unknown even when the model IS
+    // priced. Never a guess: cost_source stays 'unknown' until usage exists.
+    const costSource = usageStatus === 'parsed' ? (cost.known ? 'computed' : 'unknown') : 'unknown'
     const day = localDate(ts)
     const seq = int(rec.seq, -1)
 
@@ -497,7 +574,8 @@ class Store {
       requestId, sid, ts, day, seq, null,
       'proxy', provider, model, 'main', null, null,
       inputTokens, outputTokens, cacheRead, cacheCreation,
-      contextTokens, cost.micros, cost.known ? 'computed' : 'unknown', int(rec.durationMs, null)
+      contextTokens, cost.micros, costSource, int(rec.durationMs, null),
+      usageStatus, usageReason
     )
     if (res.changes === 0) {
       this.stats.duplicates++
@@ -505,6 +583,7 @@ class Store {
     }
 
     this.stats.proxy++
+    if (usageStatus !== 'parsed') this.stats.proxyNoUsage++
     this.q.bumpSessionTotals.run(cost.micros, sid)
     this.q.bumpDaily.run(day, cost.micros, inputTokens, outputTokens, cacheRead, cacheCreation)
     // Proxy requests are their own main thread, so they always drive their gauge.
@@ -513,8 +592,60 @@ class Store {
     return {
       action: 'proxy', requestId, sessionId: sid, provider, model,
       contextTokens, costMicros: cost.micros, costKnown: cost.known,
+      usageStatus,
       contextWindow: resolveContextWindow(model, this.windows),
     }
+  }
+
+  /**
+   * Ingest one usage-only record from a supported local CLI session log.
+   * The scanner deliberately passes no prompt/response content. Codex usage is
+   * subscription-backed (cost unknown, stored as zero); Pi reports exact cost.
+   */
+  ingestCliRequest(rec) {
+    const source = str(rec.source)
+    const sid = str(rec.sessionId)
+    const requestId = str(rec.requestId)
+    if (!['codex', 'pi'].includes(source) || !sid || !requestId) {
+      return { action: 'skipped', name: 'cli' }
+    }
+
+    const ts = str(rec.ts) || new Date().toISOString()
+    const provider = str(rec.provider) || source
+    const model = str(rec.model)
+    const project = str(rec.project)
+    const contextWindow = int(rec.contextWindow, null)
+    this.q.upsertSessionCli.run(
+      sid, str(rec.startedAt) || ts, ts, source, model, project,
+      contextWindow, this.#defaultTaskType(source, 'coding-agent')
+    )
+
+    const inputTokens = int(rec.inputTokens)
+    const outputTokens = int(rec.outputTokens)
+    const cacheRead = int(rec.cacheReadTokens)
+    const cacheCreation = int(rec.cacheCreationTokens)
+    const contextTokens = int(rec.contextTokens, inputTokens + cacheRead + cacheCreation)
+    const costMicros = Math.max(0, int(rec.costMicros))
+    const costSource = str(rec.costSource) || (source === 'codex' ? 'subscription' : 'reported')
+    const day = localDate(ts)
+
+    const res = this.q.insertRequest.run(
+      requestId, sid, ts, day, int(rec.seq, -1), null,
+      source, provider, model, 'main', null, str(rec.terminalType),
+      inputTokens, outputTokens, cacheRead, cacheCreation,
+      contextTokens, costMicros, costSource, int(rec.durationMs, null),
+      'parsed', null
+    )
+    if (res.changes === 0) {
+      this.stats.duplicates++
+      return { action: 'duplicate', requestId, sessionId: sid }
+    }
+
+    this.stats.requests++
+    this.q.bumpSessionTotals.run(costMicros, sid)
+    this.q.bumpDaily.run(day, costMicros, inputTokens, outputTokens, cacheRead, cacheCreation)
+    this.q.setContext.run(contextTokens, requestId, ts, sid)
+    return { action: 'cli', source, requestId, sessionId: sid, contextTokens, contextWindow }
   }
 
   /**
@@ -555,7 +686,7 @@ class Store {
   }
 
   #decorate(s) {
-    const win = resolveContextWindow(s.model, this.windows)
+    const win = int(s.context_window, null) || resolveContextWindow(s.model, this.windows)
     return {
       ...s,
       contextWindow: win,
@@ -591,8 +722,8 @@ class Store {
    * come from the SAME request — the latest main-thread one — so they can never
    * disagree on screen.
    */
-  getWidgetState() {
-    const session = this.getActiveSession()
+  getWidgetState(sessionId = null, runningSources = []) {
+    const session = sessionId ? (this.getSession(sessionId) || this.getActiveSession()) : this.getActiveSession()
 
     // Cache split (PRD §6 line 6): cached = cache_read, fresh = input +
     // cache_creation. The three sum to context_tokens (the gauge), so the split
@@ -611,12 +742,20 @@ class Store {
     // only ever grows and answers nothing. The widget's pill shows this count
     // and lists these sessions on click.
     const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString()
-    const activeSessions = this.db
-      .prepare(`SELECT id, source, model, task_type, cumulative_cost_micros,
-                       latest_context_tokens, last_seen_at
-                  FROM sessions WHERE last_seen_at >= ?
-                 ORDER BY last_seen_at DESC LIMIT 6`)
-      .all(cutoff)
+    const sources = [...new Set(runningSources.filter((s) => ['claude-code', 'codex', 'pi'].includes(s)))]
+    const runningClause = sources.length
+      ? ` OR source IN (${sources.map(() => '?').join(',')})`
+      : ''
+    let activeSessions = this.db
+      .prepare(`SELECT id, source, model, project, context_window, task_type,
+                       cumulative_cost_micros, latest_context_tokens, last_seen_at
+                  FROM sessions WHERE last_seen_at >= ?${runningClause}
+                 ORDER BY last_seen_at DESC LIMIT 12`)
+      .all(cutoff, ...sources)
+      .map((s) => this.#decorate(s))
+    if (session && !activeSessions.some((s) => s.id === session.id)) {
+      activeSessions = [session, ...activeSessions].slice(0, 12)
+    }
     const sessionCount = activeSessions.length
 
     // Today, per source/provider (the Jan-first panel). For local models cost
@@ -636,7 +775,7 @@ class Store {
         toksPerSec: r.duration_ms > 0 ? Math.round((r.output_tokens / (r.duration_ms / 1000)) * 10) / 10 : null,
       }))
 
-    return { session, split, daily, sessionCount, activeSessions, todayBySource, now: new Date().toISOString() }
+    return { session, selectedSessionId: session ? session.id : null, split, daily, sessionCount, activeSessions, todayBySource, now: new Date().toISOString() }
   }
 
   /**
@@ -858,8 +997,113 @@ class Store {
       .run(key, String(value))
   }
 
+  /**
+   * Proxy capture truth (Phase 3): every request that REACHED the proxy counts
+   * here, even when usage extraction failed. 'no_usage' + 'upstreamErrors' are
+   * the two gaps the old code silently swallowed.
+   */
+  getProxyStats() {
+    return {
+      requests: this.stats.proxy,
+      noUsage: this.stats.proxyNoUsage,
+      upstreamErrors: this.stats.proxyUpstreamErrors,
+    }
+  }
+
+  /**
+   * Wire-schema census (Phase 4). Every event type ever observed, whether or
+   * not it is persisted. `persisted: true` means ALLOW has a row for it.
+   * Attribute KEYS only, never values — PII cannot reach this table.
+   */
+  getEventCoverage() {
+    const rows = this.db.prepare('SELECT * FROM event_observations ORDER BY count DESC').all()
+    return rows.map((r) => ({
+      kind: r.event_kind,
+      name: r.event_name,
+      firstSeen: r.first_seen,
+      lastSeen: r.last_seen,
+      count: r.count,
+      attributes: JSON.parse(r.attribute_keys_json || '[]'),
+      persisted: ALLOW[r.event_name] != null,
+    }))
+  }
+
+  /**
+   * Full tracking state for health endpoints. Wire-level liveness comes from
+   * the COLLECTOR (lastEventAt / lastApiRequestAt are what actually arrived),
+   * store-level persistence is our own stats. Merged here so one JSON answers
+   * "is anything flowing, and is it being stored?"
+   */
+  getTrackingStatus(o = {}) {
+    const wire = deriveTrackingStatus({
+      now: o.now || new Date(),
+      startedAt: o.startedAt,
+      lastEventAt: o.lastEventAt,
+      lastEventArrivedAt: o.lastEventArrivedAt,
+      lastApiRequestAt: o.lastApiRequestAt,
+      otlpRequestCount: o.otlpRequestCount || 0,
+    })
+    return {
+      ...wire,
+      storeDown: false,
+      stored: {
+        requests: this.stats.requests,
+        compactions: this.stats.compactions,
+        sessions: this.stats.sessions,
+        proxy: this.getProxyStats(),
+      },
+    }
+  }
+
   close() {
     this.db.close()
+  }
+}
+
+/**
+ * Tracking status, derived from wire-level liveness. Pure and clock-injectable
+ * so the thresholds are testable. This is the piece that answers "is the pipe
+ * actually working" instead of letting a silent 0 on the dashboard pass for
+ * 'nothing happened'.
+ *
+ *   starting        collector booted <90s ago, nothing arrived yet
+ *   not_configured  collector has run for a while and NEVER received telemetry
+ *   partial         events arrive, but no api_request has ever been seen
+ *   healthy         events flowing, last one <5m ago, api_requests seen
+ *   idle            last event 5–30m ago
+ *   stale           last event >30m ago
+ */
+function deriveTrackingStatus({ now = new Date(), startedAt = null, lastEventAt = null, lastEventArrivedAt = null, lastApiRequestAt = null, otlpRequestCount = 0 } = {}) {
+  const base = { lastEventAt, lastEventArrivedAt, lastApiRequestAt, otlpRequestCount }
+  // Liveness is about ARRIVAL, not event time: a replayed or late-delivered
+  // event with an old timestamp still proves the pipe is working right now.
+  const livenessAt = lastEventArrivedAt || lastEventAt
+  if (!livenessAt) {
+    const bootedMs =
+      startedAt ? Math.max(0, now.getTime() - new Date(startedAt).getTime()) : null
+    if (bootedMs !== null && bootedMs < 90_000) {
+      return { status: 'starting', reason: 'collector just started; awaiting first telemetry', ...base }
+    }
+    return {
+      status: 'not_configured',
+      reason: 'No telemetry has ever arrived. Claude Code must run through the tb-claude launcher (or source env.sh in the same shell that launches claude).',
+      ...base,
+    }
+  }
+
+  const sinceMin = Math.max(0, Math.round((now.getTime() - new Date(livenessAt).getTime()) / 60000))
+  if (otlpRequestCount > 0 && !lastApiRequestAt) {
+    return {
+      status: 'partial',
+      reason: 'Events are arriving but no api_request has ever been seen, so the gauge cannot move. Try the tb-claude launcher.',
+      sinceMin, ...base,
+    }
+  }
+  if (sinceMin < 5) return { status: 'healthy', reason: 'telemetry flowing', sinceMin, ...base }
+  if (sinceMin < 30) return { status: 'idle', reason: `no telemetry for ${sinceMin}m — Claude is idle`, sinceMin, ...base }
+  return {
+    status: 'stale',
+    reason: `no telemetry for ${sinceMin}m. Claude is idle, or it was launched without TokenBench telemetry (use the tb-claude launcher).`, sinceMin, ...base,
   }
 }
 
@@ -867,6 +1111,7 @@ module.exports = {
   Store,
   MAIN_THREAD_SOURCES,
   CTX_BUCKET_EDGES,
+  deriveTrackingStatus,
   // exported for tests
   int, bool, localDate, fmtK, pick, assertNoPii, resolveContextWindow,
   loadContextWindows, ALLOW, KNOWN_PII,

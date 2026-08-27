@@ -16,5 +16,6 @@ desktop/src-tauri/binaries/
 # Generated Tauri schemas (regenerated on build)
 desktop/src-tauri/gen/
 
-# macOS
+# .gitignore
 .DS_Store
+collector.log

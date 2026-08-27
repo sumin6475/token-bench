@@ -37,6 +37,10 @@
       "icons/128x128@2x.png",
       "icons/icon.icns"
     ],
+    "macOS": {
+      "entitlements": "entitlements.plist",
+      "minimumSystemVersion": "10.15"
+    },
     "externalBin": ["binaries/node"],
     "resources": {
       "../../collector.js": "sidecar/collector.js",
@@ -47,7 +51,12 @@
       "../../src/store.js": "sidecar/src/store.js",
       "../../src/pricing.js": "sidecar/src/pricing.js",
       "../../src/proxy-core.js": "sidecar/src/proxy-core.js",
-      "../../src/schema.sql": "sidecar/src/schema.sql"
+      "../../src/cli-session-scanner.js": "sidecar/src/cli-session-scanner.js",
+      "../../src/schema.sql": "sidecar/src/schema.sql",
+      "../../bin/tokenbench": "sidecar/bin/tokenbench",
+      "../../tb-claude": "sidecar/tb-claude",
+      "../../stats.js": "sidecar/stats.js",
+      "../../env.sh": "sidecar/env.sh"
     }
   }
 }

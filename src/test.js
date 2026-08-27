@@ -17,9 +17,11 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { DatabaseSync } = require('node:sqlite')
 
-const { Store, int, bool, localDate, resolveContextWindow, loadContextWindows, CTX_BUCKET_EDGES } = require('./store.js')
+const { Store, int, bool, localDate, deriveTrackingStatus, resolveContextWindow, loadContextWindows, CTX_BUCKET_EDGES } = require('./store.js')
 const { loadPricing, resolvePricing, computeCostMicros } = require('./pricing.js')
+const { parsePs, parseCodexLine, parsePiLine } = require('./cli-session-scanner.js')
 
 let passed = 0
 let failed = 0
@@ -37,6 +39,51 @@ function test(name, fn) {
 function tmpDb() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tb-test-')), 'tb.db')
 }
+
+console.log('\nlocal CLI discovery + usage-only parsing')
+
+test('process detection recognizes Claude Code, Codex, and Pi by command boundary', () => {
+  const rows = parsePs(`
+  101  1 ttys001 00:10 claude --continue
+  102  1 ttys002 01:02 /opt/homebrew/bin/codex
+  103  1 ttys003 00:04 node /x/pi-coding-agent/dist/cli.js
+  104  1 ??      00:01 /bin/ps -axo pid,command
+  `)
+  assert.deepStrictEqual(rows.map((r) => r.source), ['claude-code', 'codex', 'pi'])
+})
+
+test('Codex token_count becomes usage metadata without prompt content', () => {
+  const state = {}
+  parseCodexLine(JSON.stringify({ type: 'session_meta', timestamp: '2026-08-27T00:00:00Z', payload: { id: 'codex-s1', cwd: '/tmp/project' } }), state)
+  parseCodexLine(JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-test', cwd: '/tmp/project' } }), state)
+  const rec = parseCodexLine(JSON.stringify({
+    type: 'event_msg', timestamp: '2026-08-27T00:01:00Z',
+    payload: { type: 'token_count', info: { model_context_window: 100000, last_token_usage: {
+      input_tokens: 50000, cached_input_tokens: 40000, cache_write_input_tokens: 1000,
+      output_tokens: 500,
+    } } },
+  }), state)
+  assert.strictEqual(rec.sessionId, 'codex-s1')
+  assert.strictEqual(rec.inputTokens, 10000)
+  assert.strictEqual(rec.cacheReadTokens, 40000)
+  assert.strictEqual(rec.contextTokens, 51000)
+  assert.strictEqual(rec.contextWindow, 100000)
+  assert.ok(!JSON.stringify(rec).includes('content'))
+})
+
+test('Pi assistant usage becomes an exact cost record without message content', () => {
+  const state = {}
+  parsePiLine(JSON.stringify({ type: 'session', id: 'pi-s1', timestamp: '2026-08-27T00:00:00Z', cwd: '/tmp/project' }), state)
+  const rec = parsePiLine(JSON.stringify({
+    type: 'message', id: 'm1', timestamp: '2026-08-27T00:01:00Z',
+    message: { role: 'assistant', provider: 'openrouter', model: 'qwen-test', content: [{ type: 'text', text: 'secret' }],
+      usage: { input: 100, output: 20, cacheRead: 900, cacheWrite: 10, cost: { total: 0.012345 } } },
+  }), state, { 'qwen-test': 128000 })
+  assert.strictEqual(rec.contextWindow, 128000)
+  assert.strictEqual(rec.costMicros, 12345)
+  assert.strictEqual(rec.contextTokens, undefined)
+  assert.ok(!JSON.stringify(rec).includes('secret'))
+})
 
 // Captured from the wire 2026-08-20; identity values synthetic, types verbatim.
 const REAL_API_REQUEST = {
@@ -561,6 +608,42 @@ test('a replayed proxy request does not double-count (idempotent on request_id)'
   s.close()
 })
 
+console.log('\nnative CLI store + selectable widget sessions')
+
+test('Codex/Pi records keep separate sessions and exact gauge windows', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const base = {
+    requestId: 'codex:r1', sessionId: 'codex-s1', source: 'codex',
+    ts: new Date().toISOString(), project: '/tmp/codex-project', provider: 'openai',
+    model: 'gpt-test', inputTokens: 10000, cacheReadTokens: 40000,
+    cacheCreationTokens: 1000, outputTokens: 500, contextTokens: 51000,
+    contextWindow: 100000, costMicros: 0, costSource: 'subscription',
+  }
+  assert.strictEqual(s.ingestCliRequest(base).action, 'cli')
+  assert.strictEqual(s.ingestCliRequest(base).action, 'duplicate')
+  s.ingestCliRequest({
+    requestId: 'pi:r1', sessionId: 'pi-s1', source: 'pi',
+    ts: new Date().toISOString(), project: '/tmp/pi-project', provider: 'openrouter',
+    model: 'qwen-test', inputTokens: 100, cacheReadTokens: 900,
+    cacheCreationTokens: 10, outputTokens: 20, contextWindow: 128000,
+    costMicros: 12345,
+  })
+
+  const codex = s.getWidgetState('codex-s1')
+  const pi = s.getWidgetState('pi-s1')
+  assert.strictEqual(codex.session.source, 'codex')
+  assert.strictEqual(codex.session.project, '/tmp/codex-project')
+  assert.strictEqual(codex.session.contextWindow, 100000)
+  assert.strictEqual(codex.session.gaugePercent, 0.51)
+  assert.strictEqual(pi.session.source, 'pi')
+  assert.strictEqual(pi.session.contextWindow, 128000)
+  assert.strictEqual(pi.session.cumulative_cost_micros, 12345)
+  assert.ok(pi.activeSessions.some((row) => row.id === 'codex-s1'))
+  assert.ok(pi.activeSessions.some((row) => row.id === 'pi-s1'))
+  s.close()
+})
+
 console.log('\nproxy routing (Jan-first: path prefixes)')
 
 const { resolveRoute } = require('./proxy-core.js')
@@ -849,6 +932,248 @@ test('activeSessions: fresh sessions in, stale sessions out', () => {
   assert.ok(!ids.includes('stale-c'), 'a session idle for 2h is not active')
   assert.strictEqual(st.sessionCount, 2, 'pill count = active sessions, not lifetime')
   s.close()
+})
+
+test('an idle session stays selectable while its CLI process is still running', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const stale = new Date(Date.now() - 2 * 3600 * 1000).toISOString()
+  s.ingestCliRequest({
+    requestId: 'pi:idle:r1', sessionId: 'pi-idle', source: 'pi', ts: stale,
+    model: 'qwen-test', inputTokens: 100, outputTokens: 10,
+  })
+  s.ingest(req({
+    'session.id': 'fresh-current', request_id: 'fresh-current-r1',
+    'event.timestamp': new Date().toISOString(), query_source: 'repl_main_thread',
+  }))
+  assert.ok(!s.getWidgetState().activeSessions.some((row) => row.id === 'pi-idle'))
+  assert.ok(s.getWidgetState(null, ['pi']).activeSessions.some((row) => row.id === 'pi-idle'))
+  s.close()
+})
+
+console.log('\nproxy ingestion with NO usage (Phase 3 — captured, never dropped)')
+
+test('a no-usage proxy request still gets a row and counts', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  const r = s.ingestProxyRequest({
+    requestId: 'no-usage-1', provider: 'openai', model: 'gpt-4o',
+    usageStatus: 'no_usage', usageReason: 'response has no usage object',
+    ts: '2026-08-20T12:00:00.000Z',
+  })
+  assert.strictEqual(r.action, 'proxy')
+  assert.strictEqual(r.usageStatus, 'no_usage')
+  const row = s.db.prepare("SELECT * FROM requests WHERE request_id='no-usage-1'").get()
+  assert.ok(row, 'a row exists even without usage')
+  assert.strictEqual(row.usage_status, 'no_usage')
+  assert.strictEqual(row.cost_source, 'unknown', 'no usage -> no cost guess')
+  assert.strictEqual(row.input_tokens, 0)
+  assert.strictEqual(s.getProxyStats().noUsage, 1)
+  assert.strictEqual(s.getSession('proxy:openai:gpt-4o').request_count, 1, 'counted in the totals')
+  s.close()
+})
+
+test('empty upstream response records empty_response', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  s.ingestProxyRequest({ requestId: 'er-1', provider: 'anthropic', model: 'claude-sonnet-4-5', usageStatus: 'empty_response', usageReason: 'empty body' })
+  const row = s.db.prepare("SELECT * FROM requests WHERE request_id='er-1'").get()
+  assert.strictEqual(row.usage_status, 'empty_response')
+  assert.strictEqual(row.cost_source, 'unknown')
+  assert.strictEqual(s.getProxyStats().noUsage, 1)
+  s.close()
+})
+
+test('parsed usage keeps cost computed and noUsage stays 0', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  s.ingestProxyRequest({ requestId: 'ok-1', provider: 'openai', model: 'gpt-4o', inputTokens: 1000, outputTokens: 500 })
+  const row = s.db.prepare("SELECT * FROM requests WHERE request_id='ok-1'").get()
+  assert.strictEqual(row.usage_status, 'parsed')
+  assert.strictEqual(row.cost_source, 'computed')
+  assert.strictEqual(s.getProxyStats().noUsage, 0)
+  s.close()
+})
+
+console.log('\nGemini parser (Phase 5)')
+
+const { parseGemini, validateUpstream, isPrivateIp } = require('./proxy-core.js')
+
+const GEMINI_USAGE = { promptTokenCount: 100, candidatesTokenCount: 20, cachedContentTokenCount: 30 }
+
+test('parseGemini: full JSON response (cached split out, like OpenAI)', () => {
+  const r = parseGemini(JSON.stringify({ modelVersion: 'models/gemini-2.5-pro', usageMetadata: GEMINI_USAGE }))
+  assert.ok(r)
+  assert.strictEqual(r.model, 'gemini-2.5-pro')
+  assert.strictEqual(r.inputTokens, 70, 'prompt 100 minus cached 30')
+  assert.strictEqual(r.cacheReadTokens, 30)
+  assert.strictEqual(r.outputTokens, 20)
+})
+
+test('parseGemini: SSE final chunk carries usageMetadata', () => {
+  const r = parseGemini('data: {"candidates":[]}\n\ndata: ' + JSON.stringify({ usageMetadata: GEMINI_USAGE }) + '\n\n')
+  assert.ok(r)
+  assert.strictEqual(r.inputTokens, 70)
+})
+
+test('parseGemini: no usageMetadata -> null (never a guess)', () => {
+  assert.strictEqual(parseGemini(JSON.stringify({ candidates: [] })), null)
+  assert.strictEqual(parseGemini('data: {}'), null)
+})
+
+console.log('\nSSRF guard (Phase 7 — x-tb-upstream restricted to public hosts)')
+
+test('isPrivateIp covers private/loopback/link-local v4+v6', () => {
+  for (const ip of ['10.0.0.1', '127.0.0.1', '192.168.1.1', '172.16.0.1', '172.31.255.255', '169.254.1.1', '0.0.0.0', '::1', 'fc00::1', 'fe80::1', '::ffff:10.0.0.1']) {
+    assert.ok(isPrivateIp(ip), `${ip} should be private`)
+  }
+  for (const ip of ['8.8.8.8', '1.1.1.1', '93.184.216.34', '2001:4860:4860::8888']) {
+    assert.ok(!isPrivateIp(ip), `${ip} should be public`)
+  }
+})
+
+test('validateUpstream refuses non-http(s) schemes and private targets', async () => {
+  assert.ok(await validateUpstream('file:///etc/passwd'), 'unsupported scheme refused')
+  assert.ok(await validateUpstream('http://10.0.0.5/'), 'private IP literal refused')
+  assert.ok(await validateUpstream('http://127.0.0.1:1337/'), 'loopback refused')
+  assert.ok(await validateUpstream('http://localhost:1337/'), 'localhost refused via DNS')
+  assert.strictEqual(await validateUpstream('http://8.8.8.8/v1', { allowPrivate: true }), null)
+})
+
+console.log('\nwire-schema census / event_observations (Phase 4)')
+
+test('every event is observed, even ones ingest drops', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  s.ingest(req()) // api_request — persisted
+  s.ingest({ kind: 'log', name: 'user_prompt', attrs: { 'session.id': 'x', prompt_text: 'secret query' } })
+  s.ingest({ kind: 'log', name: 'hook_post_tool_use', attrs: { 'session.id': 'x', tool_input: 'secret tool args' } })
+  s.ingest({ kind: 'metric', name: 'claude_code.token.usage', attrs: { type: 'input' } })
+
+  const cov = s.getEventCoverage()
+  const names = new Set(cov.map((e) => e.name))
+  assert.ok(names.has('api_request'), 'persisted event observed')
+  assert.ok(names.has('user_prompt'), 'dropped event observed')
+  assert.ok(names.has('hook_post_tool_use'), 'dropped hook event observed')
+  assert.ok(names.has('claude_code.token.usage'), 'metric observed')
+
+  const up = cov.find((e) => e.name === 'user_prompt')
+  assert.deepStrictEqual(up.attributes, ['prompt_text', 'session.id'], 'attribute KEYS only, sorted')
+  assert.strictEqual(up.persisted, false)
+  const ar = cov.find((e) => e.name === 'api_request')
+  assert.strictEqual(ar.persisted, true)
+  assert.strictEqual(ar.count, 1)
+  assert.strictEqual(s.stats.skipped, 3, 'ingest still skips the non-persisted ones')
+  s.close()
+})
+
+test('observation count accumulates across repeats; keys union', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  s.ingest({ kind: 'log', name: 'user_prompt', attrs: { a: 1 } })
+  s.ingest({ kind: 'log', name: 'user_prompt', attrs: { a: 1, b: 2 } })
+  const up = s.getEventCoverage().find((e) => e.name === 'user_prompt')
+  assert.strictEqual(up.count, 2)
+  assert.deepStrictEqual(up.attributes, ['a', 'b'], 'union of keys across occurrences')
+  s.close()
+})
+
+test('observations never store attribute VALUES — PII cannot reach the table', () => {
+  const db = tmpDb()
+  const s = new Store(db)
+  s.ingest(req()) // carries user.email / user.id etc.
+  const row = s.db.prepare("SELECT attribute_keys_json FROM event_observations WHERE event_name='api_request'").get()
+  const json = row.attribute_keys_json
+  for (const secret of ['user@example.invalid', 'user_00000000000000000000000', '11111111-1111-4111-8111-111111111111']) {
+    assert.ok(!json.includes(secret), 'identity value leaked into observation keys: ' + secret)
+  }
+  assert.ok(!json.includes('user.email') || true, 'key names are not values')
+  s.close()
+})
+
+test('a pre-migration requests table is upgraded with usage columns, not bricked', () => {
+  const db = tmpDb()
+  // Simulate a DB created before usage_status existed: the FULL old requests
+  // schema minus the two usage columns (a real old DB is complete otherwise
+  // — prepare() validates every column insertRequest references).
+  const old = new DatabaseSync(db)
+  old.exec(`CREATE TABLE requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT UNIQUE,
+    session_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    local_date TEXT NOT NULL,
+    event_sequence INTEGER,
+    prompt_id TEXT,
+    source TEXT NOT NULL DEFAULT 'claude-code',
+    provider TEXT NOT NULL DEFAULT 'anthropic',
+    model TEXT,
+    query_source TEXT,
+    speed TEXT,
+    terminal_type TEXT,
+    task_type TEXT NOT NULL DEFAULT 'unset',
+    project TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_micros INTEGER NOT NULL DEFAULT 0,
+    cost_source TEXT NOT NULL DEFAULT 'reported',
+    duration_ms INTEGER)`)
+  old.close()
+  const s = new Store(db) // must NOT throw
+  const cols = s.db.prepare('PRAGMA table_info(requests)').all().map((c) => c.name)
+  assert.ok(cols.includes('usage_status'))
+  assert.ok(cols.includes('usage_reason'))
+  // and it still ingests:
+  s.ingest(req())
+  assert.strictEqual(s.db.prepare("SELECT COUNT(*) AS n FROM requests WHERE request_id='req_011CeDQMKnn8NtLCTxYc9Zod'").get().n, 1)
+  s.close()
+})
+
+console.log('\ntracking status derivation (Phase 1 — is the pipe working?)')
+
+test('starting / not_configured when nothing has ever arrived', () => {
+  const booted = new Date()
+  assert.strictEqual(deriveTrackingStatus({ now: booted, startedAt: booted }).status, 'starting')
+  const old = new Date(Date.now() - 10 * 60000)
+  assert.strictEqual(deriveTrackingStatus({ now: new Date(), startedAt: old }).status, 'not_configured')
+})
+
+test('partial: events arrive but no api_request ever', () => {
+  const st = deriveTrackingStatus({
+    now: new Date(),
+    startedAt: new Date(Date.now() - 600000),
+    lastEventArrivedAt: new Date().toISOString(),
+    otlpRequestCount: 5,
+  })
+  assert.strictEqual(st.status, 'partial')
+})
+
+test('healthy / idle / stale by arrival recency', () => {
+  const now = new Date()
+  const withApi = {
+    now, startedAt: new Date(now.getTime() - 600000),
+    lastEventArrivedAt: now.toISOString(),
+    lastApiRequestAt: now.toISOString(), otlpRequestCount: 5,
+  }
+  assert.strictEqual(deriveTrackingStatus(withApi).status, 'healthy')
+  assert.strictEqual(deriveTrackingStatus({ ...withApi, lastEventArrivedAt: new Date(now.getTime() - 10 * 60000).toISOString() }).status, 'idle')
+  assert.strictEqual(deriveTrackingStatus({ ...withApi, lastEventArrivedAt: new Date(now.getTime() - 45 * 60000).toISOString() }).status, 'stale')
+})
+
+test('liveness is ARRIVAL, not event timestamp — an old event freshly delivered is healthy', () => {
+  const st = deriveTrackingStatus({
+    now: new Date(),
+    startedAt: new Date(Date.now() - 600000),
+    // event timestamp is ancient (a reply/replay), but it ARRIVED now
+    lastEventAt: '2025-01-01T00:00:00.000Z',
+    lastEventArrivedAt: new Date().toISOString(),
+    lastApiRequestAt: new Date().toISOString(),
+    otlpRequestCount: 1,
+  })
+  assert.strictEqual(st.status, 'healthy')
 })
 
 console.log('\nend-to-end over the real capture')

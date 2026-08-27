@@ -74,3 +74,10 @@ There is **no `model` field on compaction.** The model must be inherited from th
 - **Automatic compaction.** Only `trigger: "manual"` has been observed. PRD Q5 stands: automatic may carry a different field shape. Ingest treats every field beyond `pre_tokens` / `post_tokens` / `trigger` / `success` as optional, so an automatic event with fewer fields will still store.
 - **`api_error`.** Never observed. No table is written for it; PRD lists it as a fault indicator, not gauge input.
 - **`query_source: "main"` and `"subagent"`.** Only `sdk` and `compact` have been seen, because every capture so far has been headless. This matters for testing — see the README note on why the needle does not move under `claude -p`.
+
+## Wire-census and pipe-health additions (Phase 1 & 4, supersede nothing above)
+
+- **`event_observations` table.** One row per `(event_kind, event_name)` ever observed, keeping only the sorted union of attribute KEYS (never values, so PII and prompt content cannot reach it). Every event that ingest deliberately drops still appears here, and `stats.js` / `GET /event-coverage` report it. A Claude Code update that changes the wire becomes visible instead of melting silently.
+- **`requests.usage_status` / `requests.usage_reason`** (proxy path only). `parsed` / `no_usage` / `empty_response` — a proxy request that reached the proxy but gave back no usage object is STORED with zero tokens and `cost_source = 'unknown'`; it counts in the request totals and carries no cost guess.
+- **`deriveTrackingStatus`** — wire-level liveness (`starting / not_configured / partial / healthy / idle / stale`), anchored on when events ARRIVED, not their timestamps. Exposed at `GET /tracking-status` and in the widget's pipe pill.
+- **Gemini usage extraction** (`usageMetadata` on the final SSE chunk or root JSON) joins the OpenAI/Anthropic parsers.

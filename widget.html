@@ -58,7 +58,7 @@
   }
   .no-drag, select, button, input { -webkit-app-region: no-drag; }
 
-  select.task {
+  select.session-picker {
     background: #10131a; color: var(--text);
     border: 1px solid var(--line); border-radius: 8px;
     padding: 4px 8px; font-size: 12px; font-family: var(--sans);
@@ -72,29 +72,14 @@
     border: 1px solid rgba(45,212,191,.25);
     white-space: nowrap;
   }
-  .sessions-pill {
-    font-size: 10px; color: var(--muted);
-    border: 1px solid var(--line); border-radius: 999px;
-    padding: 3px 6px; white-space: nowrap; cursor: pointer;
-    background: none; font-family: var(--sans);
+  .cli-strip { display: none; gap: 5px; flex-wrap: wrap; margin: -1px 0 6px; }
+  .cli-chip {
+    appearance: none; background: rgba(45,212,191,.08); color: var(--teal);
+    border: 1px solid rgba(45,212,191,.25); border-radius: 999px;
+    padding: 3px 7px; font: 600 10px var(--sans); cursor: pointer;
   }
-  .sessions-pill:hover { color: var(--text); border-color: var(--baseline, var(--line)); }
-
-  /* Which-sessions popover (click the pill). */
-  .sess-pop {
-    position: absolute; top: 34px; right: 0; z-index: 20; display: none;
-    background: #0c0e12; border: 1px solid var(--line); border-radius: 10px;
-    padding: 8px 10px; min-width: 250px;
-    box-shadow: 0 8px 28px rgba(0,0,0,.55);
-  }
-  .sess-pop .hd2 { font-size: 9px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
-  .sess-pop .srow { display: flex; align-items: baseline; gap: 6px; font-size: 11px; margin: 4px 0; white-space: nowrap; }
-  .sess-pop .sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); flex: none; align-self: center; }
-  .sess-pop .srow.driving .sdot { background: var(--teal); }
-  .sess-pop .smodel { color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
-  .sess-pop .stask { color: var(--muted); }
-  .sess-pop .scost { margin-left: auto; font-family: var(--mono); color: var(--text); }
-  .sess-pop .sago { color: var(--muted); font-size: 10px; }
+  .cli-chip:hover { border-color: var(--teal); background: rgba(45,212,191,.14); }
+  .cli-chip.untracked { color: var(--amber); border-color: rgba(245,158,11,.35); }
   .dash-btn {
     background: none; border: 1px solid var(--line); border-radius: 8px;
     color: var(--muted); padding: 3px 7px; cursor: pointer; line-height: 0;
@@ -119,11 +104,14 @@
   body.tauri-shell .meta { margin-top: auto; }
   body.tauri-shell hr.divider { margin-top: auto; }
   body.tauri-shell .empty { margin: auto; }
-  select.task:disabled { opacity: .55; cursor: default; }
+  select.session-picker:disabled { opacity: .55; cursor: default; }
 
   .meta { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 2px; }
   .model { font-size: 12px; color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .project { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pipe { font-size: 9px; padding: 0 6px; border-radius: 8px; color: var(--muted); border: 1px solid var(--line, #333); white-space: nowrap; line-height: 15px; }
+  .pipe.warn { color: #fbbf24; border-color: rgba(251, 191, 36, .45); }
+  .pipe.dim { opacity: .55; }
 
   .gauge-wrap { position: relative; margin: 2px 0 0; }
   svg.gauge { display: block; width: 100%; height: auto; }
@@ -169,9 +157,6 @@
   .today .det .money { color: var(--text); }
   .today .det .warn { color: var(--amber); }
 
-  /* Nudge: the active session is still unlabeled after a few requests. */
-  select.task.nudge { border-color: var(--amber); box-shadow: 0 0 0 1px rgba(245, 158, 11, .55); }
-
   .empty { text-align: center; color: var(--muted); font-size: 12px; padding: 26px 8px; line-height: 1.5; }
   .stale { color: var(--amber); }
   .foot { text-align: center; font-size: 9px; color: #4b5563; margin-top: 6px; letter-spacing: .03em; }
@@ -183,16 +168,10 @@
        plain browser); also a drag region. -->
   <div class="lights-strip" data-tauri-drag-region></div>
   <div class="titlebar" data-tauri-drag-region style="position: relative;">
-    <select class="task" id="task" title="Task type — applies to the whole session, and is remembered for future sessions from this source">
-      <option value="coding-agent">coding-agent</option>
-      <option value="product-brainstorm">product-brainstorm</option>
-      <option value="business-brainstorm">business-brainstorm</option>
-      <option value="general">general</option>
-      <option value="unset">unset</option>
+    <select class="session-picker" id="session-picker" title="Choose the CLI session that drives this gauge">
+      <option value="">Waiting for a tracked session…</option>
     </select>
-    <span class="badge" id="source">—</span>
-    <button class="sessions-pill" id="sessions" style="display:none" title="Active sessions (last 30 min) — click to see which"></button>
-    <div class="sess-pop" id="sesspop"><div class="hd2">Active sessions</div><div id="sessrows"></div></div>
+    <span class="badge" id="source" style="display:none"></span>
     <button class="dash-btn" id="dash" title="Open dashboard (⌘D in the app)">
       <svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
         <rect x="1" y="7" width="2.6" height="5" rx="1" fill="currentColor"/>
@@ -201,6 +180,7 @@
       </svg>
     </button>
   </div>
+  <div class="cli-strip" id="cli-strip"></div>
 
   <div id="body">
     <div class="empty" id="empty">connecting…</div>
@@ -209,6 +189,7 @@
       <div class="meta" data-tauri-drag-region>
         <span class="model" id="model">—</span>
         <span class="project" id="project"></span>
+        <span class="pipe" id="pipe" title="telemetry pipe status"></span>
       </div>
 
       <div class="gauge-wrap">
@@ -328,7 +309,17 @@ const usd = (micros) => '$' + (Number(micros || 0) / 1e6).toFixed(4)
 const el = (id) => document.getElementById(id)
 const empty = el('empty'), live = el('live')
 
-let current = null   // last state, for the task-type/budget writes
+let current = null
+let selectedSessionId = localStorage.getItem('tokenbench.selectedSession') || ''
+
+const SOURCE_LABEL = {
+  'claude-code': 'Claude Code',
+  codex: 'Codex',
+  pi: 'Pi',
+  proxy: 'Proxy',
+}
+const sourceLabel = (source) => SOURCE_LABEL[source] || source || 'unknown'
+const projectName = (project) => project ? project.split('/').filter(Boolean).pop() : ''
 
 // --- render -----------------------------------------------------------------
 function render(state) {
@@ -345,18 +336,38 @@ function render(state) {
   // dial at rest reads 0, it doesn't disappear.
   const s = state.session
 
+  // telemetry pipe status (Phase 1). A silent collector must not look alive.
+  const pipe = el('pipe')
+  let t = state.tracking || {}
+  if (s && (s.source === 'codex' || s.source === 'pi')) {
+    const age = Date.now() - new Date(s.last_seen_at).getTime()
+    t = age < 15000
+      ? { status: 'healthy', reason: `${sourceLabel(s.source)} session log is updating` }
+      : { status: 'idle', reason: `${sourceLabel(s.source)} session has no new usage` }
+  }
+  const PIPE = {
+    healthy:   ['', 'live'],
+    idle:      ['dim', 'idle'],
+    starting:  ['dim', 'waiting for telemetry…'],
+    partial:   ['warn', 'events, no api requests'],
+    stale:     ['warn', 'no telemetry for a while'],
+    not_configured: ['warn', 'not configured'],
+  }
+  const [cls, label] = PIPE[t.status] || ['warn', t.status || '?' ]
+  pipe.textContent = label
+  pipe.className = 'pipe ' + cls
+  pipe.title = t.reason || label
+
   // header
-  el('source').textContent = s ? (s.source || 'claude-code') : 'idle'
-  el('model').textContent = s ? (s.model || 'unknown model') : 'waiting for a session'
-  el('project').textContent = (s && s.project) || ''
-  const task = el('task')
-  task.disabled = !s
-  task.value = s && ['coding-agent','product-brainstorm','business-brainstorm','general','unset']
-    .includes(s.task_type) ? s.task_type : 'unset'
-  const sp = el('sessions')
-  if (state.sessionCount > 1) { sp.style.display = ''; sp.textContent = state.sessionCount + ' sessions' }
-  else { sp.style.display = 'none'; el('sesspop').style.display = 'none' }
-  renderSessPop(state)
+  renderSessionPicker(state)
+  renderRunningClis(state)
+  const selectedIsRunning = !!s && (state.runtime && state.runtime.runningClis || []).some((p) => p.source === s.source)
+  const source = el('source')
+  source.style.display = selectedIsRunning ? '' : 'none'
+  source.textContent = selectedIsRunning ? sourceLabel(s.source) : ''
+  el('model').textContent = s ? `${sourceLabel(s.source)} · ${s.model || 'unknown model'}` : 'waiting for a session'
+  el('project').textContent = s ? projectName(s.project) : ''
+  el('project').title = (s && s.project) || ''
 
   // gauge — rests at 0 with the needle visible; the gray no-needle state is
   // reserved for the one case a position would be a lie: tokens known but the
@@ -391,10 +402,6 @@ function render(state) {
   bar.style.width = Math.min(100, frac * 100).toFixed(1) + '%'
   bar.style.background = frac >= 1 ? 'var(--red)' : frac >= 0.85 ? 'var(--amber)' : 'var(--teal)'
 
-  // Nudge (task-type part 3): unlabeled after a few requests -> amber outline.
-  // Forgetting is fixable — relabeling applies to the whole session.
-  el('task').classList.toggle('nudge', !!s && s.task_type === 'unset' && s.request_count >= 3)
-
   // Today by source (Jan-first): every provider that did work today, at a
   // glance. Local models show throughput + tokens instead of a useless $0.
   renderToday(state.todayBySource)
@@ -409,7 +416,7 @@ function renderToday(rows) {
   panel.style.display = 'block'  // NOT '' — the stylesheet default is display:none
   el('todayrows').innerHTML = rows.map((r) => {
     const isLocal = r.provider === 'local'
-    const name = r.source === 'claude-code' ? 'claude code' : (r.provider || '?')
+    const name = r.source === 'proxy' ? (r.provider || '?') : sourceLabel(r.source)
     const det = isLocal
       ? `${r.toksPerSec !== null ? r.toksPerSec + ' tok/s · ' : ''}${n(r.output_tokens)} tok`
       : `<span class="money">${usd(r.cost_micros)}</span>` +
@@ -428,17 +435,20 @@ function renderSplit(split) {
 
 function splitText(t) { el('split').textContent = t }
 
-// Preview hooks: ?shell=1 forces the app layout; ?pop=1 opens the sessions
-// popover after first render (screenshots only).
-if (location.search.includes('pop=1')) el('sesspop').style.display = 'block'
 // Preview hook: ?shell=1 forces the app layout in a plain browser (screenshots).
 if (location.search.includes('shell=1')) document.body.classList.add('tauri-shell')
 
 // --- polling ----------------------------------------------------------------
 async function poll() {
   try {
-    const r = await fetch('/state', { cache: 'no-store' })
-    render(await r.json())
+    const query = selectedSessionId ? `?session=${encodeURIComponent(selectedSessionId)}` : ''
+    const r = await fetch('/state' + query, { cache: 'no-store' })
+    const state = await r.json()
+    if (state.selectedSessionId && state.selectedSessionId !== selectedSessionId) {
+      selectedSessionId = state.selectedSessionId
+      localStorage.setItem('tokenbench.selectedSession', selectedSessionId)
+    }
+    render(state)
   } catch (e) {
     live.style.display = 'none'; empty.style.display = '';
     empty.innerHTML = '<span class="stale">collector not reachable</span>'
@@ -447,15 +457,70 @@ async function poll() {
 poll()
 setInterval(poll, 1000)
 
-// --- task-type override (P1-2) ---------------------------------------------
-el('task').addEventListener('change', async (e) => {
-  if (!current || !current.session) return
-  await fetch('/task-type', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId: current.session.id, taskType: e.target.value }),
-  }).catch(() => {})
+// --- session selection ------------------------------------------------------
+function sessionOptionLabel(s) {
+  const bits = [sourceLabel(s.source)]
+  const project = projectName(s.project)
+  if (project) bits.push(project)
+  if (s.model) bits.push(s.model)
+  return bits.join(' · ')
+}
+
+function renderSessionPicker(state) {
+  const picker = el('session-picker')
+  const list = state.activeSessions || []
+  const before = picker.value
+  picker.replaceChildren()
+  if (!list.length) {
+    const option = document.createElement('option')
+    option.value = ''; option.textContent = 'Waiting for a tracked session…'
+    picker.appendChild(option); picker.disabled = true
+    return
+  }
+  picker.disabled = false
+  for (const s of list) {
+    const option = document.createElement('option')
+    option.value = s.id
+    option.textContent = sessionOptionLabel(s)
+    picker.appendChild(option)
+  }
+  const target = state.selectedSessionId || selectedSessionId || before
+  if ([...picker.options].some((o) => o.value === target)) picker.value = target
+}
+
+el('session-picker').addEventListener('change', (e) => {
+  selectedSessionId = e.target.value
+  if (selectedSessionId) localStorage.setItem('tokenbench.selectedSession', selectedSessionId)
+  else localStorage.removeItem('tokenbench.selectedSession')
   poll()
 })
+
+function renderRunningClis(state) {
+  const strip = el('cli-strip')
+  strip.replaceChildren()
+  const running = state.runtime && state.runtime.runningClis || []
+  if (!running.length) { strip.style.display = 'none'; return }
+  strip.style.display = 'flex'
+  const grouped = new Map()
+  for (const p of running) grouped.set(p.source, [...(grouped.get(p.source) || []), p])
+  for (const [source, processes] of grouped) {
+    const button = document.createElement('button')
+    button.className = 'cli-chip'
+    const match = (state.activeSessions || []).find((s) => s.source === source)
+    if (!match) button.classList.add('untracked')
+    button.textContent = sourceLabel(source)
+    button.title = match
+      ? `Show the newest ${sourceLabel(source)} session${processes[0].tty ? ` on ${processes[0].tty}` : ''}`
+      : `${sourceLabel(source)} is running, but no usage has arrived yet`
+    button.addEventListener('click', () => {
+      if (!match) return
+      selectedSessionId = match.id
+      localStorage.setItem('tokenbench.selectedSession', selectedSessionId)
+      poll()
+    })
+    strip.appendChild(button)
+  }
+}
 
 // --- editable daily budget (P0-5) ------------------------------------------
 el('budget').addEventListener('click', () => {
@@ -477,45 +542,6 @@ el('budget').addEventListener('click', () => {
   }
   input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') commit(); if (ev.key === 'Escape') input.replaceWith(span) })
   input.addEventListener('blur', commit)
-})
-
-// --- which-sessions popover --------------------------------------------------
-function relTime(iso) {
-  const sec = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
-  if (sec < 90) return 'now'
-  if (sec < 3600) return Math.round(sec / 60) + 'm'
-  return Math.round(sec / 3600) + 'h'
-}
-
-function renderSessPop(state) {
-  const rows = el('sessrows'); rows.replaceChildren()
-  const list = state.activeSessions || []
-  const drivingId = state.session && state.session.id
-  for (const a of list) {
-    const row = document.createElement('div')
-    row.className = 'srow' + (a.id === drivingId ? ' driving' : '')
-    const dot = document.createElement('span'); dot.className = 'sdot'
-    dot.title = a.id === drivingId ? 'drives the gauge' : ''
-    const model = document.createElement('span'); model.className = 'smodel'
-    model.textContent = a.source === 'proxy' ? (a.model || a.id) : (a.model || 'unknown')
-    const task = document.createElement('span'); task.className = 'stask'
-    task.textContent = a.task_type === 'unset' ? '' : a.task_type
-    const cost = document.createElement('span'); cost.className = 'scost'
-    cost.textContent = usd(a.cumulative_cost_micros)
-    const ago = document.createElement('span'); ago.className = 'sago'
-    ago.textContent = relTime(a.last_seen_at)
-    row.append(dot, model, task, cost, ago)
-    rows.appendChild(row)
-  }
-}
-
-el('sessions').addEventListener('click', (e) => {
-  e.stopPropagation()
-  const pop = el('sesspop')
-  pop.style.display = pop.style.display === 'block' ? 'none' : 'block'
-})
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('.sess-pop, .sessions-pill')) el('sesspop').style.display = 'none'
 })
 
 // --- Tauri shell integration ------------------------------------------------

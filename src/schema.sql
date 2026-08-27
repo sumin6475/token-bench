@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   source                    TEXT NOT NULL DEFAULT 'claude-code',
   start_type                TEXT,             -- from claude_code.session.count
   model                     TEXT,             -- most recent model seen
+  project                   TEXT,             -- cwd from local CLI session logs
+  context_window            INTEGER,          -- exact window reported by the CLI
   task_type                 TEXT NOT NULL DEFAULT 'unset',
 
   -- the gauge (PRD 5.1)
@@ -81,7 +83,15 @@ CREATE TABLE IF NOT EXISTS requests (
 
   cost_micros           INTEGER NOT NULL DEFAULT 0,
   cost_source           TEXT NOT NULL DEFAULT 'reported',
-  duration_ms           INTEGER
+  duration_ms           INTEGER,
+
+  -- proxy-only capture truth (Phase "usage unavailable must not vanish"):
+  --   parsed            -> usage object was found and tokens extracted
+  --   no_usage          -> response had no usage object (stream_options.include_usage missing, etc.)
+  --   empty_response    -> upstream returned nothing parseable (error body, timeout, …)
+  -- NULL on the Claude Code (OTLP) path.
+  usage_status          TEXT,
+  usage_reason          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id, event_sequence);
@@ -157,4 +167,23 @@ CREATE TABLE IF NOT EXISTS daily_totals (
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
+-- event_observations — wire-schema census (Phase 4).
+--
+-- One row per (event_kind, event_name) ever observed, even for events ingest
+-- intentionally drops (user_prompt, assistant_response, hook_*, …). Only
+-- attribute KEYS are kept, never values, so a Claude Code update that changes
+-- the wire schema is visible here instead of melting silently. PII and prompt
+-- content cannot reach this table: it stores no attribute values at all.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS event_observations (
+  event_kind          TEXT NOT NULL,
+  event_name          TEXT NOT NULL,
+  first_seen          TEXT NOT NULL,
+  last_seen           TEXT NOT NULL,
+  count               INTEGER NOT NULL DEFAULT 0,
+  attribute_keys_json TEXT NOT NULL DEFAULT '[]',  -- union of keys seen, sorted
+  PRIMARY KEY (event_kind, event_name)
 );
